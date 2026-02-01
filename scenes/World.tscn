@@ -1,4 +1,4 @@
-[gd_scene load_steps=14 format=4 uid="uid://523bfoduv382"]
+[gd_scene format=4 uid="uid://523bfoduv382"]
 
 [ext_resource type="Material" uid="uid://bqmo3a1qborlv" path="res://assets/textures/Terrain/Terrain.tres" id="1_7g83o"]
 [ext_resource type="Script" uid="uid://cw2ymw46rjc68" path="res://scripts/terrain_generation/terrain_generator.gd" id="1_kqs1s"]
@@ -71,33 +71,33 @@ uv1_scale = Vector3(5, 5, 5)
 [sub_resource type="PlaneMesh" id="PlaneMesh_0uv0p"]
 size = Vector2(128, 128)
 
-[node name="Node3D" type="Node3D"]
+[node name="Node3D" type="Node3D" unique_id=1312596387]
 
-[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1818822539]
 transform = Transform3D(-0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, 0.75, -0.433013, 0, 0, 0)
 shadow_enabled = true
 
-[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+[node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1647099817]
 environment = SubResource("Environment_io8um")
 
-[node name="TerrainGenerator" type="MeshInstance3D" parent="."]
+[node name="TerrainGenerator" type="MeshInstance3D" parent="." unique_id=322492574]
 transform = Transform3D(2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0)
 material_override = ExtResource("1_7g83o")
 mesh = SubResource("ArrayMesh_w7bcd")
 script = ExtResource("1_kqs1s")
 heightmap = ExtResource("3_1lgw5")
-height_scale = 0.0
+height_scale = 40.0
 metadata/_custom_type_script = "uid://cw2ymw46rjc68"
 
-[node name="CharacterBody3D" parent="." instance=ExtResource("2_32lhk")]
+[node name="CharacterBody3D" parent="." unique_id=1057580769 instance=ExtResource("2_32lhk")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -22.431625, 130.10849, 50.548164)
 
-[node name="MeshInstance3D" type="MeshInstance3D" parent="."]
+[node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1700046886]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 6, 0)
 visible = false
 material_override = SubResource("StandardMaterial3D_0uv0p")
 mesh = SubResource("PlaneMesh_0uv0p")
 
-[node name="Node3D" type="Node3D" parent="."]
+[node name="Node3D" type="Node3D" parent="." unique_id=1920606467]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -763.8683, 226.3287, 10.114821)
 script = ExtResource("5_1lgw5")
