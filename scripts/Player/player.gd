@@ -1,7 +1,7 @@
 extends CharacterBody3D
 
 # Настройки движения
-const FORWARD_SPEED = 5.0
+const FORWARD_SPEED =20.0
 const MOUSE_SENSITIVITY = 0.005 # Настройте эту величину для чувствительности
 
 # Диапазоны вращения по оси X (вверх/вниз)
