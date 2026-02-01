@@ -24,9 +24,8 @@ extends Node3D
 @export var noise_floor: float = 0.00
 @export var brightness: float = 0.0                  ## Brightness offset (adjust with +/-)
 @export var brightness_step: float = 0.00            ## How much +/- changes brightness
-@export var auto_contrast_min: float = 0.1           ## Minimum brightness for lowest terrain
-@export var auto_contrast_max: float = 1.0           ## Maximum brightness for highest terrain
-@export_range(0.0, 1.0) var intensity_blend: float = 0.5  ## 0=height only, 1=intensity only
+@export var auto_contrast_min: float = 0.1           ## Minimum brightness for lowest reflection
+@export var auto_contrast_max: float = 1.0           ## Maximum brightness for highest reflection
 
 @export_category("Noise Models (toggle with keys)")
 @export var enable_multiplicative_speckle: bool = false  ## Key 1: Exponential/Gamma speckle
@@ -94,12 +93,11 @@ var _last_hit_pos: Vector3 = Vector3.ZERO
 var _had_hit: bool = false
 var _verify_sample_counter: int = 0
 
-# Auto-contrast: track min/max height during scan
-var _min_height_this_scan: float = 1e9
-var _max_height_this_scan: float = -1e9
+# Auto-contrast: track min/max intensity during scan
+var _min_intensity_this_scan: float = 1e9
+var _max_intensity_this_scan: float = -1e9
 
-# Height buffer for auto-contrast normalization
-var _height_buffer: PackedFloat32Array
+# Intensity buffer for auto-contrast normalization (angle-based reflection)
 var _intensity_buffer: PackedFloat32Array
 var _count_buffer: PackedInt32Array  # Track samples per pixel for averaging
 
@@ -113,12 +111,11 @@ func _ready() -> void:
 	_img_back.fill(background_color)
 	_tex = ImageTexture.create_from_image(_img_front)
 	
-	# Initialize height buffer for auto-contrast
+	# Initialize intensity buffer for auto-contrast
 	var buffer_size: int = image_size * image_size
-	_height_buffer.resize(buffer_size)
 	_intensity_buffer.resize(buffer_size)
 	_count_buffer.resize(buffer_size)
-	_clear_height_buffer()
+	_clear_intensity_buffer()
 	
 	# Initialize per-azimuth shadow tracking
 	_max_elev_per_az.resize(azimuth_bins)
@@ -127,13 +124,12 @@ func _ready() -> void:
 	_create_debug()
 	call_deferred("_attach_ui")
 
-func _clear_height_buffer() -> void:
-	for i in range(_height_buffer.size()):
-		_height_buffer[i] = 0.0      # Accumulator (will divide by count)
-		_intensity_buffer[i] = 0.0
+func _clear_intensity_buffer() -> void:
+	for i in range(_intensity_buffer.size()):
+		_intensity_buffer[i] = 0.0   # Accumulator (will divide by count)
 		_count_buffer[i] = 0         # Sample count
-	_min_height_this_scan = 1e9
-	_max_height_this_scan = -1e9
+	_min_intensity_this_scan = 1e9
+	_max_intensity_this_scan = -1e9
 
 func _reset_shadow_tracking() -> void:
 	for i in range(azimuth_bins):
@@ -258,7 +254,7 @@ func _advance_scan() -> void:
 			_reset_shadow_tracking()
 			# Apply auto-contrast and render final image
 			_apply_auto_contrast()
-			_clear_height_buffer()
+			_clear_intensity_buffer()
 
 func _attach_ui() -> void:
 	_ui_layer = CanvasLayer.new()
@@ -438,17 +434,16 @@ func _render_radar_sample(az_bin: int, elev_bin: int) -> void:
 			if enable_additive_noise:
 				intensity += noise_floor * (0.7 + 0.6 * randf())
 			
-			# Store height and intensity in buffer for auto-contrast (accumulate for averaging)
+			# Store intensity in buffer for auto-contrast (accumulate for averaging)
 			var buf_idx: int = px_y * image_size + px_x
-			if buf_idx >= 0 and buf_idx < _height_buffer.size():
-				_height_buffer[buf_idx] += hit_pos.y
+			if buf_idx >= 0 and buf_idx < _intensity_buffer.size():
 				_intensity_buffer[buf_idx] += intensity
 				_count_buffer[buf_idx] += 1
-				# Track min/max height
-				if hit_pos.y < _min_height_this_scan:
-					_min_height_this_scan = hit_pos.y
-				if hit_pos.y > _max_height_this_scan:
-					_max_height_this_scan = hit_pos.y
+				# Track min/max intensity for auto-contrast
+				if intensity < _min_intensity_this_scan:
+					_min_intensity_this_scan = intensity
+				if intensity > _max_intensity_this_scan:
+					_max_intensity_this_scan = intensity
 				
 				# Verify height with vertical raycast
 				if debug_verify_height:
@@ -477,15 +472,15 @@ func _render_radar_sample(az_bin: int, elev_bin: int) -> void:
 						_img_back.set_pixel(px_bx, px_by, Color(0.0, new_g, 0.0, 1.0))
 
 func _apply_auto_contrast() -> void:
-	# Fill back buffer based on height-normalized values
+	# Fill back buffer based on intensity (angle-based reflection)
 	_img_back.fill(background_color)
 	
-	var height_range: float = _max_height_this_scan - _min_height_this_scan
-	if height_range < 0.01:
-		height_range = 1.0  # Avoid division by zero
+	var intensity_range: float = _max_intensity_this_scan - _min_intensity_this_scan
+	if intensity_range < 0.001:
+		intensity_range = 1.0  # Avoid division by zero
 	
-	# Print height range for debugging
-	print("Height range: %.2f to %.2f (delta: %.2f)" % [_min_height_this_scan, _max_height_this_scan, height_range])
+	# Print intensity range for debugging
+	print("Intensity range: %.3f to %.3f (delta: %.3f)" % [_min_intensity_this_scan, _max_intensity_this_scan, intensity_range])
 	
 	for y in range(image_size):
 		for x in range(image_size):
@@ -493,19 +488,14 @@ func _apply_auto_contrast() -> void:
 			var count: int = _count_buffer[buf_idx]
 			
 			if count > 0:  # Valid pixel with samples
-				# Average the accumulated values
-				var h: float = _height_buffer[buf_idx] / float(count)
+				# Average the accumulated intensity
 				var intensity: float = _intensity_buffer[buf_idx] / float(count)
 				
-				# Normalize height to 0-1
-				var h_norm: float = (h - _min_height_this_scan) / height_range
+				# Normalize intensity to 0-1 using auto-contrast
+				var i_norm: float = (intensity - _min_intensity_this_scan) / intensity_range
 				
-				# Map height to auto-contrast range
-				var height_contrib: float = lerp(auto_contrast_min, auto_contrast_max, h_norm)
-				
-				# Blend height-based brightness with intensity (which includes noise)
-				# Height provides base contrast, intensity adds noise effects
-				var v: float = height_contrib * (1.0 - intensity_blend) + intensity * intensity_blend
+				# Map to auto-contrast range
+				var v: float = lerp(auto_contrast_min, auto_contrast_max, i_norm)
 				
 				# Apply brightness offset
 				v += brightness
