@@ -1,86 +1,112 @@
 import numpy as np
 import trimesh
 import matplotlib.pyplot as plt
+from PIL import Image
+from tqdm import tqdm
 
 class RadarSimulator:
     def __init__(self):
-        # --- CONFIGURATION ---
-        self.velocity = 200.0   # m/s (Aircraft speed)
-        self.radar_pos = np.array([0, 0, 1000]) # Aircraft at 1km altitude
-        self.wavelength = 0.03  # X-Band (approx 3cm)
+        self.velocity = 200.0   
+        self.radar_pos = np.array([0, 0, 1000]) 
+        self.wavelength = 0.03  
         self.beamwidth_deg = 3.5 
         
-        # Resolution settings
-        # High azimuth count to get clean definition on the cube edges
+        # Raycasting Resolution
         self.azimuth_count = 500 
         self.elevation_count = 150 
 
-    def create_scene(self, cube_rotation_deg=45):
+    def load_heightmap_to_mesh(self, image_path, world_size=2000, max_height=100):
         """
-        Creates the simulation world (Mesh).
+        Converts a greyscale image into a 3D Trimesh object.
         """
+        try:
+            # Load image and convert to Greyscale (L)
+            img = Image.open(image_path).convert('L')
+        except FileNotFoundError:
+            print(f"ERROR: Could not find {image_path}. Generating flat terrain instead.")
+            return trimesh.creation.box(extents=[world_size, world_size, 1])
+
+        # Downscale slightly if resolution is huge (keeps raycasting fast)
+        # 256x256 is perfectly fine.
+        width, height = img.size
+        pixels = np.array(img)
+        
+        # Create a grid of X, Y coordinates
+        x = np.linspace(0, world_size, width)
+        y = np.linspace(0, world_size, height)
+        xv, yv = np.meshgrid(x, y)
+        
+        # Scale Z values (0-255 -> 0-max_height)
+        z = (pixels / 255.0) * max_height
+        
+        # Flatten arrays to create vertex list
+        # We center the terrain at 1250, 1250
+        x_flat = xv.flatten() + (1250 - world_size/2)
+        y_flat = yv.flatten() + (1250 - world_size/2)
+        z_flat = z.flatten()
+        
+        vertices = np.column_stack((x_flat, y_flat, z_flat))
+        
+        # Create Faces (Triangles)
+        # This connects the grid points into triangles
+        faces = []
+        for r in range(height - 1):
+            for c in range(width - 1):
+                # Indices in the flattened array
+                i0 = r * width + c
+                i1 = i0 + 1
+                i2 = (r + 1) * width + c
+                i3 = i2 + 1
+                
+                # Two triangles per grid square
+                faces.append([i0, i2, i1])
+                faces.append([i1, i2, i3])
+        
+        # Create the mesh
+        terrain_mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+        
+        # Calculate normals for lighting/radar reflection
+        terrain_mesh.fix_normals()
+        
+        return terrain_mesh
+
+    def create_scene(self, heightmap_path):
         objects = []
-
-        # 1. The Floor (Large area to capture shadows)
-        # We place it slightly below z=0 to avoid z-fighting with bottom of cube
-        floor = trimesh.creation.box(extents=[4000, 4000, 1]) 
-        floor.apply_translation([1250, 1250, -0.5]) 
-        floor.visual.face_colors = [100, 100, 100, 255]
-        objects.append(floor)
-
-        # 2. The Cube (Target)
-        # 100m x 100m x 100m
-        cube = trimesh.creation.box(extents=[100, 100, 100])
         
-        # Rotate around Z axis
-        cube.apply_transform(trimesh.transformations.rotation_matrix(np.radians(cube_rotation_deg), [0, 0, 1]))
+        # 1. THE TERRAIN (From Heightmap)
+        print("Generating Terrain Mesh...")
+        terrain = self.load_heightmap_to_mesh(heightmap_path, world_size=1000, max_height=80)
+        objects.append(terrain)
+
+        # 2. THE CUBE
+        cube = trimesh.creation.box(extents=[60, 60, 60])
+        cube.apply_transform(trimesh.transformations.rotation_matrix(np.radians(45), [0, 0, 1]))
         
-        # Place on top of floor (Z=0 to Z=100)
-        # Center is at Z=50
-        cube.apply_translation([1250, 1250, 50]) 
+        # Place cube. We put it at Z=60 so it sits roughly "on" the hills 
+        # (You might need to adjust this depending on how high your black/white pixels are)
+        cube.apply_translation([1250, 1250, 60]) 
         objects.append(cube)
 
-        scene = trimesh.util.concatenate(objects)
-        return scene
-
-    def get_pointing_angles(self, target_pos):
-        """
-        Calculates Azimuth and Elevation to look at a specific point.
-        """
-        vec = target_pos - self.radar_pos
-        dist = np.linalg.norm(vec)
-        
-        # Azimuth (Angle around Z axis, 0 is North/Y)
-        # Note: We use (x, y) for atan2. 
-        az = np.arctan2(vec[0], vec[1]) 
-        
-        # Elevation (Angle from +Z axis/Up)
-        el = np.arccos(vec[2] / dist)
-        
-        return az, el
+        return trimesh.util.concatenate(objects)
 
     def scan(self, scene_mesh):
-        """
-        Simulates the Radar Scan using Raycasting and DBS processing.
-        """
-        # --- 1. AUTO-AIM ---
-        # Look at the ground spot (1250, 1250, 0)
+        # --- AIMING ---
         target_center = np.array([1250, 1250, 0]) 
-        az_center, el_center = self.get_pointing_angles(target_center)
+        vec = target_center - self.radar_pos
+        dist_center = np.linalg.norm(vec)
+        az_center = np.arctan2(vec[0], vec[1]) 
+        el_center = np.arccos(vec[2] / dist_center)
         
-        # Define Field of View (FoV)
-        # 15 degrees wide to see context around the cube
+        # --- RAYS ---
         az_width = np.radians(15) 
         el_height = np.radians(15)
 
-        # Generate Grid of Angles
         az_angles = np.linspace(az_center - az_width/2, az_center + az_width/2, self.azimuth_count)
         el_angles = np.linspace(el_center - el_height/2, el_center + el_height/2, self.elevation_count)
         
         az_grid, el_grid = np.meshgrid(az_angles, el_angles)
         az_flat, el_flat = az_grid.flatten(), el_grid.flatten()
         
-        # Convert Spherical -> Cartesian Directions
         x = np.sin(el_flat) * np.sin(az_flat)
         y = np.sin(el_flat) * np.cos(az_flat)
         z = np.cos(el_flat)
@@ -88,142 +114,103 @@ class RadarSimulator:
         ray_dirs = np.column_stack((x, y, z))
         ray_origins = np.tile(self.radar_pos, (len(ray_dirs), 1))
 
-        # --- 2. RAYCASTING ---
-        # multiple_hits=False : Stops at the first surface (solves the "ghost" issue)
+        # --- RAYCAST ---
         locations, index_ray, index_tri = scene_mesh.ray.intersects_location(
             ray_origins=ray_origins,
             ray_directions=ray_dirs,
             multiple_hits=False 
         )
         
-        if len(locations) == 0:
-            print("No hits! Check aiming logic.")
-            return [], []
+        print(f"Rays Cast: {len(ray_dirs)}, Hits: {len(locations)}")
+        if len(locations) == 0: return [], []
 
-        # --- 3. SIGNAL PROCESSING ---
-        real_beam_data = []
         dbs_data = []
-        
-        # Pre-fetch normals for lighting calc
         all_normals = scene_mesh.face_normals[index_tri]
 
-        for i, hit_point in enumerate(locations):
+        for i, hit_point in enumerate(tqdm(locations, desc="Processing hits", unit="ray")):
             # Geometry
             rel_pos = hit_point - self.radar_pos
             dist = np.linalg.norm(rel_pos)
             true_az = np.arctan2(hit_point[0], hit_point[1])
-
-            # Vector Math
-            view_dir = rel_pos / dist
             normal = all_normals[i]
+            view_dir = rel_pos / dist
             
-            # Dot Product: 1.0 = Perpendicular (Bright), 0.0 = Glancing (Dark)
+            # --- INTENSITY (STRENGTH) ---
+            # Dot Product: How perpendicular is the surface?
             incidence = abs(np.dot(view_dir, normal))
             
-            # --- INTENSITY MODEL ---
-            # Identify if we hit the Cube or the Floor based on Height (Z)
-            is_cube = hit_point[2] > 2.0 
+            # HEIGHT CHECK: Cube vs Terrain
+            # The Cube is likely higher than the surrounding terrain in this spot
+            # We assume anything above Z=50 is the cube (adjust based on your heightmap!)
+            is_cube = hit_point[2] > 55.0 
             
             if is_cube:
-                # CUBE: Specular Reflection (Shiny)
-                # Power of 4 makes faces very bright only if looking straight at them.
-                # We multiply by 10 to make it "hot"
-                intensity = (incidence ** 4) * 10.0
-                
-                # Boost the Top Face slightly so it's visible despite the bad angle
-                # (The top face normal is roughly [0,0,1])
-                if normal[2] > 0.9: 
-                    intensity = 2.0 # Force a baseline visibility for top
-                    
+                # CUBE: Specular (Shiny)
+                # Very bright if hit head-on, dim if glancing
+                intensity = (incidence ** 6) * 15.0 
+                # Layover fix: Boost top face slightly so we can see it
+                if normal[2] > 0.8: intensity = max(intensity, 2.0)
             else:
-                # FLOOR: Diffuse Reflection (Rough)
-                # 0.05 base + incidence^2
-                # Ensures we always see the ground, even at glancing angles
-                intensity = 0.05 + (incidence ** 2) * 0.2
-
-            # Speckle Noise (Radar "Grain")
+                # TERRAIN: Diffuse (Rough)
+                # Heightmap ground reflects moderately in all directions
+                # We also modulate by height to make "hills" look brighter than "valleys"
+                intensity = 0.1 + (incidence * 0.5)
+            
+            # Speckle Noise
             intensity *= np.random.uniform(0.5, 1.5)
 
-            # --- DOPPLER CALCULATION ---
-            # v_closing = v_aircraft * cos(angle)
+            # --- DBS MATH ---
             cos_theta = np.cos(true_az)
             doppler = (2 * self.velocity * cos_theta) / self.wavelength
 
-            # --- MODE A: REAL BEAM (BLURRY) ---
-            # Simulate poor angular resolution by adding noise to the Angle
-            beam_noise = np.radians(np.random.normal(0, self.beamwidth_deg/2.0))
-            meas_az_rb = true_az + beam_noise
-            
-            rb_x = dist * np.sin(meas_az_rb)
-            rb_y = dist * np.cos(meas_az_rb)
-            real_beam_data.append([rb_x, rb_y, intensity])
-
-            # --- MODE B: DBS (SHARPENED) ---
-            # Simulate frequency measurement -> Angle
-            # Add small Hz noise (FFT bin size)
             fd_meas = doppler + np.random.normal(0, 15.0)
-            
-            # Reverse the Doppler Equation: theta = acos( (fd * lambda) / 2v )
-            val = (fd_meas * self.wavelength) / (2 * self.velocity)
-            val = np.clip(val, -1.0, 1.0) # Safety clamp
-            
+            val = np.clip((fd_meas * self.wavelength) / (2 * self.velocity), -1, 1)
             meas_az_dbs = np.arccos(val)
-            
-            # Ambiguity Fix: If hit was on the left (negative X), flip angle
-            # (In a real radar, this requires complex IQ processing or beam steering)
             if hit_point[0] < 0: meas_az_dbs = -meas_az_dbs
             
             dbs_x = dist * np.sin(meas_az_dbs)
             dbs_y = dist * np.cos(meas_az_dbs)
+            
+            # Save: X, Y, Intensity
             dbs_data.append([dbs_x, dbs_y, intensity])
 
-        return np.array(real_beam_data), np.array(dbs_data)
+        return np.array(dbs_data)
 
 # --- EXECUTION ---
 if __name__ == "__main__":
     sim = RadarSimulator()
     
-    # Create Scene (Try rotating: 0, 30, 45)
-    scene = sim.create_scene(cube_rotation_deg=0)
+    # PUT YOUR PATH HERE
+    path_to_heightmap = "assets/heightmaps/Perlin_22-256x256.png"
     
-    print("Simulating Radar Scan... (Raycasting)")
-    rb, dbs = sim.scan(scene)
+    scene = sim.create_scene(path_to_heightmap)
+    print("Raycasting complex terrain... (This may take a moment)")
+    dbs_data = sim.scan(scene)
 
-    # --- VISUALIZATION ---
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 7), facecolor='black')
+    # --- PLOTTING ---
+    plt.figure(figsize=(10, 10), facecolor='black')
+    ax = plt.gca()
 
-    def plot_sim(ax, data, title):
-        if len(data) == 0: return
+    if len(dbs_data) > 0:
+        # Sort so bright pixels (Cube) draw on top of dim pixels (Ground)
+        dbs_data = dbs_data[dbs_data[:, 2].argsort()]
         
-        # Filter very weak noise for a cleaner plot
-        mask = data[:,2] > 0.02
-        d = data[mask]
+        # Plot with INFERNO colormap (Dark -> Red -> Yellow -> White)
+        sc = ax.scatter(dbs_data[:,0], dbs_data[:,1], c=dbs_data[:,2], cmap='inferno', s=4, alpha=1.0)
         
-        # Sort by intensity (Draw bright points on top of dim ones)
-        d = d[d[:, 2].argsort()]
-        
-        # Plot (Inferno colormap matches radar phosphor screens well)
-        ax.scatter(d[:,0], d[:,1], c=d[:,2], cmap='inferno', s=3, alpha=1.0)
-        
-        ax.set_title(title, color='white', fontsize=14)
-        ax.set_aspect('equal')
-        
-        # Center the Camera on the Target
-        target_x, target_y = 1250, 1250
-        radius = 300 # Meters around target
-        
-        ax.set_xlim(target_x - radius, target_x + radius)
-        ax.set_ylim(target_y - radius, target_y + radius)
-        
-        # Style
-        ax.grid(True, color='#333333', alpha=0.5, linestyle=':')
-        ax.set_facecolor('black')
-        
-        # Draw small crosshair at true center
-        ax.plot(target_x, target_y, 'w+', markersize=10, alpha=0.3)
+        # Add colorbar
+        cbar = plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Return Strength (Intensity)', color='white')
+        cbar.ax.yaxis.set_tick_params(color='white')
+        plt.setp(plt.getp(cbar.ax.axes, 'yticklabels'), color='white')
 
-    plot_sim(ax1, rb, "Real Beam (Blurry)")
-    plot_sim(ax2, dbs, "DBS (Sharpened)\nNote: Top Face appears at Bottom (Layover)")
+    ax.set_title("DBS Radar: Cube on Perlin Terrain", color='white')
+    ax.set_aspect('equal')
+    ax.set_facecolor('black')
+    
+    # Frame the camera
+    ax.set_xlim(1000, 1500)
+    ax.set_ylim(1000, 1500)
+    ax.grid(True, color='#333333', linestyle=':')
 
-    plt.tight_layout()
     plt.show()

@@ -1,10 +1,11 @@
 # Godot 4.x - DBS (Doppler Beam Sharpening) Radar
 # Based on working Python implementation
+# Optimized: Raycasting spread over multiple frames for better FPS
 extends Node3D
 
 @export_category("Aircraft Movement")
 @export var velocity_mps: float = 200.0              ## Aircraft velocity in m/s (flight direction is +Y)
-@export var orbit_radius: float = 300.0              ## Radius of circular orbit around target
+@export var orbit_radius: float = 150.0              ## Radius of circular orbit around target (closer to middle)
 @export var orbit_altitude: float = 100.0            ## Constant altitude above map_center.y
 @export var enable_movement: bool = false            ## Toggle movement
 @export var orbit_clockwise: bool = true             ## Orbit direction
@@ -13,11 +14,16 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 
 @export_category("Radar Parameters")
 @export var wavelength_m: float = 0.03               ## X-band ~3cm wavelength
-@export var beam_width_deg: float = 16.0              ## Beam width in both azimuth and elevation
+@export var beam_width_deg: float = 17.0             ## Beam width for ~40x40m scan area
 
 @export_category("Raycasting Resolution")
 @export var azimuth_count: int = 500                 ## Number of rays in azimuth
 @export var elevation_count: int = 150               ## Number of rays in elevation
+
+@export_category("Performance")
+@export var rays_per_frame: int = 5000               ## Number of rays to cast per frame (adjust for FPS)
+@export var target_fps: float = 30.0                 ## Target FPS - auto-adjusts rays_per_frame
+@export var raycast_budget_ms: float = 8.0           ## Time budget for raycasting per frame (ms)
 
 @export_category("Map Area")
 @export var map_center: Vector3 = Vector3.ZERO       ## Center of target area (where beam aims)
@@ -34,7 +40,7 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 @export var intensity_gamma: float = 0.5             ## Gamma correction for intensity
 
 @export_category("Noise")
-@export var doppler_noise_std: float = 15.0          ## Standard deviation of Doppler noise (Hz)
+@export var doppler_noise_std: float = 5.0          ## Standard deviation of Doppler noise (Hz)
 @export var enable_speckle: bool = true              ## Enable speckle noise
 
 @export_category("Surface Properties")
@@ -80,8 +86,46 @@ var _first_frame: bool = true
 var _debug_timer: float = 10.0  # Start high to trigger debug immediately
 var _should_debug: bool = false
 
+# --- Chunked processing state ---
+var _ray_directions: PackedVector3Array     # Pre-computed ray directions
+var _current_ray_index: int = 0             # Current position in ray array
+var _scan_in_progress: bool = false         # Is a scan currently in progress?
+var _scan_radar_pos: Vector3                # Radar position at scan start
+var _scan_vel_dir: Vector3                  # Velocity direction at scan start
+var _scan_dist_to_center: float             # Distance to target at scan start
+var _total_rays: int = 0                    # Total rays in current scan
+var _scan_start_time: float = 0.0           # Time when scan started
+var _last_fps: float = 60.0                 # Last measured FPS for auto-adjustment
+var _scan_max_range: float = 0.0            # Max ray distance for current scan
+
+# Reusable ray query object (avoid per-ray allocation)
+var _ray_query: PhysicsRayQueryParameters3D
+
+# Pre-computed colormap lookup table (256 entries x 3 bytes RGB)
+var _colormap_lut: PackedByteArray
+
+# Pre-built background pixel buffer (avoids clearing each frame)
+var _bg_pixels: PackedByteArray
+
+# --- Threading state for parallel rendering ---
+var _render_mutex := Mutex.new()
+var _render_pending: bool = false
+var _task_dbs: int = -1
+var _task_rb: int = -1
+var _pixels_dbs: PackedByteArray
+var _pixels_rb: PackedByteArray
+
 func _ready() -> void:
+	_build_colormap_lut()
+	_build_background_pixels()
 	_space_state = get_world_3d().direct_space_state
+	
+	# Create reusable ray query object once
+	_ray_query = PhysicsRayQueryParameters3D.new()
+	_ray_query.collide_with_areas = false
+	_ray_query.collide_with_bodies = true
+	_ray_query.hit_back_faces = false  # Skip backface hits - reduces work
+	_ray_query.hit_from_inside = false
 	
 	# Set starting position on circular orbit
 	_orbit_angle = 0.0
@@ -97,12 +141,14 @@ func _ready() -> void:
 	
 	_dbs_data = PackedVector3Array()
 	_rb_data = PackedVector3Array()
+	_ray_directions = PackedVector3Array()
 	
 	_create_debug()
 	call_deferred("_attach_ui")
 	
 	print("DBS Radar initialized at position: ", global_transform.origin)
 	print("Aiming at map_center: ", map_center)
+	print("Performance: rays_per_frame = ", rays_per_frame)
 
 func _update_orbit_position() -> void:
 	# Aircraft orbits around map_center at fixed radius and altitude
@@ -120,6 +166,11 @@ func _get_velocity_direction() -> Vector3:
 		return Vector3(sin(_orbit_angle), 0.0, -cos(_orbit_angle))
 
 func _exit_tree() -> void:
+	# Wait for any pending render tasks before cleanup
+	if _task_dbs >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_dbs)
+	if _task_rb >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_rb)
 	if is_instance_valid(_ui_layer):
 		_ui_layer.queue_free()
 
@@ -128,6 +179,15 @@ func _process(delta: float) -> void:
 	if _first_frame:
 		_first_frame = false
 		return
+	
+	# Track FPS for auto-adjustment
+	if delta > 0:
+		_last_fps = 1.0 / delta
+		# Auto-adjust rays_per_frame to maintain target FPS
+		if _last_fps < target_fps * 0.9:
+			rays_per_frame = maxi(500, int(rays_per_frame * 0.9))
+		elif _last_fps > target_fps * 1.1 and rays_per_frame < 20000:
+			rays_per_frame = mini(20000, int(rays_per_frame * 1.05))
 	
 	# Debug timer - only print debug every 2 seconds
 	_debug_timer += delta
@@ -147,40 +207,37 @@ func _process(delta: float) -> void:
 			_orbit_angle -= delta_angle
 		_update_orbit_position()
 	
-	# Perform DBS scan each frame
-	_perform_dbs_scan()
+	# Check if parallel render tasks completed - apply results on main thread
+	_check_render_completion()
+	
+	# Process DBS scan in chunks (only if not waiting for render)
+	if not _render_pending:
+		_process_dbs_scan_chunk()
 	
 	if debug_draw_beam:
 		_draw_debug()
 
-func _perform_dbs_scan() -> void:
+func _start_new_scan() -> void:
+	"""Initialize a new scan cycle"""
 	_dbs_data.clear()
 	_rb_data.clear()
+	_ray_directions.clear()
+	_current_ray_index = 0
 	
-	var radar_pos: Vector3 = global_transform.origin
+	_scan_radar_pos = global_transform.origin
+	_scan_vel_dir = _get_velocity_direction().normalized()
 	
-	# --- AIMING: Calculate beam direction toward target ---
-	var vec_to_target: Vector3 = map_center - radar_pos
-	var dist_to_center: float = vec_to_target.length()
+	# Calculate beam direction toward target
+	var vec_to_target: Vector3 = map_center - _scan_radar_pos
+	_scan_dist_to_center = vec_to_target.length()
 	
-	if dist_to_center < 0.1:
-		if _should_debug:
-			print("WARNING: Radar too close to target center")
+	if _scan_dist_to_center < 0.1:
+		_scan_in_progress = false
 		return
 	
-	# Calculate azimuth and elevation to target center
-	# We'll use the beam direction directly and rotate around it
 	_beam_dir = vec_to_target.normalized()
 	
-	if _should_debug:
-		print("=== DBS SCAN DEBUG ===")
-		print("Radar pos: ", radar_pos)
-		print("Map center: ", map_center)
-		print("Vec to target: ", vec_to_target, " dist: ", dist_to_center)
-		print("Beam dir: ", _beam_dir)
-	
-	# --- RAY GENERATION ---
-	# Use rotation from beam center instead of spherical coords
+	# Pre-generate all ray directions
 	var half_beam_rad: float = deg_to_rad(beam_width_deg * 0.5)
 	
 	# Find two perpendicular axes to the beam direction
@@ -191,9 +248,6 @@ func _perform_dbs_scan() -> void:
 	var perp2: Vector3 = _beam_dir.cross(perp1).normalized()
 	
 	# Generate ray directions in a grid by rotating around beam center
-	var ray_origins: PackedVector3Array = PackedVector3Array()
-	var ray_directions: PackedVector3Array = PackedVector3Array()
-	
 	for i in range(azimuth_count):
 		var t1: float = float(i) / float(azimuth_count - 1) - 0.5 if azimuth_count > 1 else 0.0
 		var angle1: float = t1 * 2.0 * half_beam_rad
@@ -202,183 +256,228 @@ func _perform_dbs_scan() -> void:
 			var t2: float = float(j) / float(elevation_count - 1) - 0.5 if elevation_count > 1 else 0.0
 			var angle2: float = t2 * 2.0 * half_beam_rad
 			
-			# Rotate beam direction by small angles around two perpendicular axes
 			var ray_dir: Vector3 = _beam_dir.rotated(perp1, angle1).rotated(perp2, angle2).normalized()
-			
-			ray_origins.append(radar_pos)
-			ray_directions.append(ray_dir)
+			_ray_directions.append(ray_dir)
 	
-	# --- RAYCASTING ---
-	var total_hits: int = 0
-	var max_intensity: float = 0.0
+	_total_rays = _ray_directions.size()
+	_scan_in_progress = true
+	_scan_start_time = Time.get_ticks_msec() / 1000.0
 	
-	# Debug: test a single ray straight at map_center first
-	if _should_debug:
-		var test_ray_end: Vector3 = radar_pos + _beam_dir * (dist_to_center * 2.0)
-		var test_query := PhysicsRayQueryParameters3D.create(radar_pos, test_ray_end)
-		test_query.collision_mask = collision_mask
-		var test_hit: Dictionary = _space_state.intersect_ray(test_query)
-		print("Test ray from ", radar_pos, " to ", test_ray_end)
-		print("Test ray dir: ", _beam_dir)
-		if test_hit.is_empty():
-			print("TEST RAY: NO HIT!")
-		else:
-			print("TEST RAY HIT: ", test_hit.get("position"), " normal: ", test_hit.get("normal"))
-		print("Total rays to cast: ", ray_origins.size())
-		if ray_origins.size() > 0:
-			print("Sample ray dir[0]: ", ray_directions[0])
-			print("Sample ray dir[mid]: ", ray_directions[ray_origins.size() / 2])
+	# Configure ray query for this scan
+	_scan_max_range = _scan_dist_to_center * 2.0
+	_ray_query.from = _scan_radar_pos
+	_ray_query.collision_mask = collision_mask
+
+func _process_dbs_scan_chunk() -> void:
+	"""Process rays until time budget spent (prevents frame spikes)"""
 	
-	for ray_idx in range(ray_origins.size()):
-		var ray_origin: Vector3 = ray_origins[ray_idx]
-		var ray_dir: Vector3 = ray_directions[ray_idx]
+	# Start a new scan if not in progress
+	if not _scan_in_progress:
+		_start_new_scan()
+		if not _scan_in_progress:
+			return
+	
+	# Time-budget based processing (more consistent than fixed ray count)
+	var start_usec: int = Time.get_ticks_usec()
+	var budget_usec: int = int(raycast_budget_ms * 1000.0)
+	
+	# Cache frequently accessed values for speed
+	var space_state: PhysicsDirectSpaceState3D = _space_state
+	var from_pos: Vector3 = _scan_radar_pos
+	var max_range: float = _scan_max_range
+	var ray_dirs: PackedVector3Array = _ray_directions
+	var total: int = _total_rays
+	
+	while _current_ray_index < total:
+		# Check time budget every ray
+		if Time.get_ticks_usec() - start_usec >= budget_usec:
+			break
 		
-		var ray_end: Vector3 = ray_origin + ray_dir * (dist_to_center * 2.0)
-		var query := PhysicsRayQueryParameters3D.create(ray_origin, ray_end)
-		query.collision_mask = collision_mask
+		# Reuse query object - just update the endpoint
+		_ray_query.to = from_pos + ray_dirs[_current_ray_index] * max_range
 		
-		var hit: Dictionary = _space_state.intersect_ray(query)
+		var hit: Dictionary = space_state.intersect_ray(_ray_query)
+		if not hit.is_empty():
+			_process_ray_hit(hit["position"], hit["normal"])
 		
-		if hit.is_empty():
-			continue
-		
-		var hit_point: Vector3 = hit.get("position", Vector3.ZERO)
-		var hit_normal: Vector3 = hit.get("normal", Vector3.UP)
-		
-		total_hits += 1
-		
-		# --- GEOMETRY CALCULATIONS ---
-		var rel_pos: Vector3 = hit_point - radar_pos
-		var dist: float = rel_pos.length()
-		var view_dir: Vector3 = rel_pos.normalized()
-		
-		# Get the actual direction of the aircraft's velocity
-		var vel_dir: Vector3 = _get_velocity_direction().normalized()
-		
-		# --- INTENSITY CALCULATION ---
-		# Incidence angle (how perpendicular is the surface?)
-		var incidence: float = abs(view_dir.dot(hit_normal.normalized()))
-		
-		var intensity: float
-		
-		# Height check: distinguish cube (specular) from terrain (diffuse)
-		var is_cube: bool = hit_point.y > cube_height_threshold
-		
-		if is_cube:
-			# CUBE: Specular reflection (shiny)
-			intensity = pow(incidence, specular_exponent) * specular_multiplier
-			# Boost top face slightly
-			if hit_normal.y > 0.8:
-				intensity = max(intensity, 2.0)
-		else:
-			# TERRAIN: Diffuse reflection (rough)
-			intensity = diffuse_base + incidence * diffuse_multiplier
-		
-		# Speckle noise
-		if enable_speckle:
-			intensity *= randf_range(0.5, 1.5)
-		
-		if intensity > max_intensity:
-			max_intensity = intensity
-		
-		# --- DBS MATH ---
-		# The Cosine of the angle is the Dot Product of view and velocity directions
-		var cos_theta: float = view_dir.dot(vel_dir)
-		
-		# Calculate Doppler frequency
-		var doppler: float = (2.0 * velocity_mps * cos_theta) / wavelength_m
-		
-		# Add Doppler measurement noise
-		var fd_meas: float = doppler + randfn(0.0, doppler_noise_std)
-		
-		# Calculate measured azimuth from Doppler
-		# meas_az_dbs = arccos((fd * lambda) / (2 * V))
-		var val: float = clamp((fd_meas * wavelength_m) / (2.0 * velocity_mps), -1.0, 1.0)
-		var meas_az_dbs: float = acos(val)
-		
-		# Handle negative azimuth (left/right of velocity vector)
-		# Calculate a "Right" vector relative to the aircraft's velocity
-		var right_vec: Vector3 = vel_dir.cross(Vector3.UP).normalized()
-		
-		# Check if the hit point is to the left or right of the aircraft's path
-		if rel_pos.dot(right_vec) < 0.0:
-			meas_az_dbs = -meas_az_dbs
-		
-		# DBS coordinates
-		var dbs_x: float = dist * sin(meas_az_dbs)
-		var dbs_y: float = dist * cos(meas_az_dbs)
-		
-		# --- REAL BEAM (BLURRY) ---
-		# Simulate poor angular resolution by adding noise to the angle
-		# Calculate true azimuth relative to velocity vector
-		var true_az_vel: float = acos(clamp(cos_theta, -1.0, 1.0))
-		if rel_pos.dot(right_vec) < 0.0:
-			true_az_vel = -true_az_vel
-		
-		# Add beam width noise (simulates poor angular resolution)
-		var beam_noise: float = randfn(0.0, deg_to_rad(beam_width_deg / 2.0))
-		var meas_az_rb: float = true_az_vel + beam_noise
-		
-		# Real Beam coordinates
-		var rb_x: float = dist * sin(meas_az_rb)
-		var rb_y: float = dist * cos(meas_az_rb)
-		
-		# Debug first few hits
-		if _should_debug and total_hits <= 3:
-			print("Hit #%d: pos=%s, dist=%.1f, cos_theta=%.3f, doppler=%.1f, dbs=(%.1f, %.1f), rb=(%.1f, %.1f)" % [
-				total_hits, hit_point, dist, cos_theta, doppler, dbs_x, dbs_y, rb_x, rb_y
-			])
-		
-		# Store: x, y, intensity
-		_dbs_data.append(Vector3(dbs_x, dbs_y, intensity))
-		_rb_data.append(Vector3(rb_x, rb_y, intensity))
+		_current_ray_index += 1
+	
+	# Check if scan is complete
+	if _current_ray_index >= total:
+		_finalize_scan()
+
+func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3) -> void:
+	"""Process a single ray hit and add to data buffers"""
+	var rel_pos: Vector3 = hit_point - _scan_radar_pos
+	var dist: float = rel_pos.length()
+	var view_dir: Vector3 = rel_pos.normalized()
+	
+	# Incidence angle
+	var incidence: float = abs(view_dir.dot(hit_normal.normalized()))
+	
+	var intensity: float
+	var is_cube: bool = hit_point.y > cube_height_threshold
+	
+	if is_cube:
+		intensity = pow(incidence, specular_exponent) * specular_multiplier
+		if hit_normal.y > 0.8:
+			intensity = max(intensity, 2.0)
+	else:
+		intensity = diffuse_base + incidence * diffuse_multiplier
+	
+	if enable_speckle:
+		intensity *= randf_range(0.5, 1.5)
+	
+	# DBS math
+	var cos_theta: float = view_dir.dot(_scan_vel_dir)
+	var doppler: float = (2.0 * velocity_mps * cos_theta) / wavelength_m
+	var fd_meas: float = doppler + randfn(0.0, doppler_noise_std)
+	
+	var val: float = clamp((fd_meas * wavelength_m) / (2.0 * velocity_mps), -1.0, 1.0)
+	var meas_az_dbs: float = acos(val)
+	
+	var right_vec: Vector3 = _scan_vel_dir.cross(Vector3.UP).normalized()
+	if rel_pos.dot(right_vec) < 0.0:
+		meas_az_dbs = -meas_az_dbs
+	
+	var dbs_x: float = dist * sin(meas_az_dbs)
+	var dbs_y: float = dist * cos(meas_az_dbs)
+	
+	# Real Beam
+	var true_az_vel: float = acos(clamp(cos_theta, -1.0, 1.0))
+	if rel_pos.dot(right_vec) < 0.0:
+		true_az_vel = -true_az_vel
+	
+	var beam_noise: float = randfn(0.0, deg_to_rad(beam_width_deg / 2.0))
+	var meas_az_rb: float = true_az_vel + beam_noise
+	
+	var rb_x: float = dist * sin(meas_az_rb)
+	var rb_y: float = dist * cos(meas_az_rb)
+	
+	_dbs_data.append(Vector3(dbs_x, dbs_y, intensity))
+	_rb_data.append(Vector3(rb_x, rb_y, intensity))
+
+func _finalize_scan() -> void:
+	"""Finish scan and start parallel render tasks"""
+	_scan_in_progress = false
+	
+	var scan_duration: float = Time.get_ticks_msec() / 1000.0 - _scan_start_time
 	
 	if _should_debug:
-		if total_hits > 0:
-			print("DBS Scan: %d hits, max intensity=%.2f, dbs_data size=%d" % [total_hits, max_intensity, _dbs_data.size()])
-		else:
-			print("DBS Scan: 0 hits! Radar at %s, aiming at %s, rays cast=%d" % [radar_pos, map_center, ray_origins.size()])
+		print("=== SCAN COMPLETE ===")
+		print("Total rays: %d, Hits: %d" % [_total_rays, _dbs_data.size()])
+		print("Scan duration: %.2f sec, FPS: %.1f, rays_per_frame: %d" % [scan_duration, _last_fps, rays_per_frame])
 	
-	# Render both images
-	_render_dbs_image()
-	_render_rb_image()
-
-func _render_dbs_image() -> void:
-	_render_image_to(_img, _tex, _dbs_data, "DBS")
-
-func _render_rb_image() -> void:
-	_render_image_to(_img_rb, _tex_rb, _rb_data, "RB")
-
-func _render_image_to(img: Image, tex: ImageTexture, data: PackedVector3Array, label: String) -> void:
-	img.fill(background_color)
+	# Prevent starting new scan until render completes
+	_render_pending = true
 	
-	if data.size() == 0:
-		if _should_debug:
-			print("RENDER %s: No data to render!" % label)
-		tex.update(img)
+	# Duplicate data so next scan won't mutate it while rendering
+	var dbs_copy: PackedVector3Array = _dbs_data.duplicate()
+	var rb_copy: PackedVector3Array = _rb_data.duplicate()
+	
+	# Start parallel render tasks for DBS and RB
+	_task_dbs = WorkerThreadPool.add_task(_task_compute_pixels.bind(dbs_copy, true))
+	_task_rb = WorkerThreadPool.add_task(_task_compute_pixels.bind(rb_copy, false))
+
+func _check_render_completion() -> void:
+	"""Poll render tasks and apply results on main thread when done"""
+	if not _render_pending:
 		return
 	
-	if _should_debug:
-		print("RENDER %s: Drawing %d points" % [label, data.size()])
+	if not WorkerThreadPool.is_task_completed(_task_dbs):
+		return
+	if not WorkerThreadPool.is_task_completed(_task_rb):
+		return
 	
-	# Determine display range
+	# Both tasks done - acknowledge completion (required by docs)
+	WorkerThreadPool.wait_for_task_completion(_task_dbs)
+	WorkerThreadPool.wait_for_task_completion(_task_rb)
+	_task_dbs = -1
+	_task_rb = -1
+	
+	# Get results under lock
+	_render_mutex.lock()
+	var px_dbs: PackedByteArray = _pixels_dbs
+	var px_rb: PackedByteArray = _pixels_rb
+	_render_mutex.unlock()
+	
+	# Apply to textures on main thread (required)
+	_img.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_dbs)
+	_tex.update(_img)
+	_img_rb.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_rb)
+	_tex_rb.update(_img_rb)
+	
+	_render_pending = false
+
+func _task_compute_pixels(data: PackedVector3Array, is_dbs: bool) -> void:
+	"""Worker task: compute pixels only (no Image/Texture - thread safe)"""
+	var pixels: PackedByteArray = _compute_pixels_only(data)
+	
+	_render_mutex.lock()
+	if is_dbs:
+		_pixels_dbs = pixels
+	else:
+		_pixels_rb = pixels
+	_render_mutex.unlock()
+
+func _build_colormap_lut() -> void:
+	"""Pre-compute 256-entry colormap lookup table for fast rendering"""
+	_colormap_lut = PackedByteArray()
+	_colormap_lut.resize(256 * 3)  # 256 colors x RGB
+	
+	for i in range(256):
+		var t: float = float(i) / 255.0
+		var color: Color = _get_colormap_color(t)
+		_colormap_lut[i * 3] = int(color.r * 255.0)
+		_colormap_lut[i * 3 + 1] = int(color.g * 255.0)
+		_colormap_lut[i * 3 + 2] = int(color.b * 255.0)
+
+func _build_background_pixels() -> void:
+	"""Pre-build background pixel buffer once (avoid clearing each frame)"""
+	_bg_pixels = PackedByteArray()
+	_bg_pixels.resize(image_size * image_size * 3)
+	var bg_r: int = int(background_color.r * 255.0)
+	var bg_g: int = int(background_color.g * 255.0)
+	var bg_b: int = int(background_color.b * 255.0)
+	for i in range(0, _bg_pixels.size(), 3):
+		_bg_pixels[i] = bg_r
+		_bg_pixels[i + 1] = bg_g
+		_bg_pixels[i + 2] = bg_b
+
+func _compute_pixels_only(data: PackedVector3Array) -> PackedByteArray:
+	"""Pure CPU pixel computation - thread safe, no Image/Texture usage"""
+	var data_size: int = data.size()
+	
+	# Start from pre-built background (duplicate for independent writable copy)
+	var pixels: PackedByteArray = _bg_pixels.duplicate()
+	var row_stride: int = image_size * 3
+	var max_coord: int = image_size - 1
+	
+	if data_size == 0:
+		return pixels
+	
+	# Calculate ranges in single pass
 	var x_min: float = display_range_x.x
 	var x_max: float = display_range_x.y
 	var y_min: float = display_range_y.x
 	var y_max: float = display_range_y.y
+	var i_min: float = INF
+	var i_max: float = -INF
 	
 	if auto_fit_range:
-		# Find data extents
 		x_min = INF
 		x_max = -INF
 		y_min = INF
 		y_max = -INF
 		
-		for point in data:
+		for i in range(data_size):
+			var point: Vector3 = data[i]
 			if point.x < x_min: x_min = point.x
 			if point.x > x_max: x_max = point.x
 			if point.y < y_min: y_min = point.y
 			if point.y > y_max: y_max = point.y
+			if point.z < i_min: i_min = point.z
+			if point.z > i_max: i_max = point.z
 		
 		# Add 10% margin
 		var x_margin: float = (x_max - x_min) * 0.1
@@ -390,91 +489,71 @@ func _render_image_to(img: Image, tex: ImageTexture, data: PackedVector3Array, l
 		
 		# Ensure minimum range
 		if x_max - x_min < 10.0:
-			var mid: float = (x_min + x_max) / 2.0
+			var mid: float = (x_min + x_max) * 0.5
 			x_min = mid - 5.0
 			x_max = mid + 5.0
 		if y_max - y_min < 10.0:
-			var mid: float = (y_min + y_max) / 2.0
+			var mid: float = (y_min + y_max) * 0.5
 			y_min = mid - 5.0
 			y_max = mid + 5.0
+	else:
+		for i in range(data_size):
+			var z: float = data[i].z
+			if z < i_min: i_min = z
+			if z > i_max: i_max = z
 	
+	# Pre-compute scale factors
 	var x_range: float = x_max - x_min
 	var y_range: float = y_max - y_min
+	var i_range: float = maxf(i_max - i_min, 0.001)
+	var x_scale: float = float(image_size - 1) / x_range
+	var y_scale: float = float(image_size - 1) / y_range
+	var i_scale: float = 255.0 / i_range
 	
-	if _should_debug:
-		print("RENDER %s: X range [%.1f, %.1f], Y range [%.1f, %.1f]" % [label, x_min, x_max, y_min, y_max])
+	# Local copy of LUT for thread safety
+	var lut: PackedByteArray = _colormap_lut
+	var gamma: float = intensity_gamma
 	
-	# Find intensity range for normalization
-	var i_min: float = INF
-	var i_max: float = -INF
-	for point in data:
-		if point.z < i_min: i_min = point.z
-		if point.z > i_max: i_max = point.z
-	
-	var i_range: float = i_max - i_min
-	if i_range < 0.001:
-		i_range = 1.0
-	
-	if _should_debug:
-		print("RENDER %s: Intensity range [%.3f, %.3f]" % [label, i_min, i_max])
-	
-	# Sort by intensity so bright pixels draw on top (like Python does)
-	var sorted_data: Array = []
-	for point in data:
-		sorted_data.append(point)
-	sorted_data.sort_custom(func(a, b): return a.z < b.z)
-	
-	var pixels_drawn: int = 0
-	
-	# Render each point
-	for point in sorted_data:
-		var dbs_x: float = point.x
-		var dbs_y: float = point.y
-		var intensity: float = point.z
+	# Render all points using byte array
+	for i in range(data_size):
+		var point: Vector3 = data[i]
 		
 		# Map to image coordinates
-		var img_x: int = int((dbs_x - x_min) / x_range * float(image_size - 1))
-		var img_y: int = int((dbs_y - y_min) / y_range * float(image_size - 1))
+		var img_x: int = clampi(int((point.x - x_min) * x_scale), 0, max_coord)
+		var img_y: int = clampi(max_coord - int((point.y - y_min) * y_scale), 0, max_coord)
 		
-		# Flip Y so higher values are at top
-		img_y = image_size - 1 - img_y
+		# Normalize intensity, apply gamma, and get LUT index
+		var norm: float = clampf((point.z - i_min) * i_scale / 255.0, 0.0, 1.0)
+		var lut_idx: int = clampi(int(pow(norm, gamma) * 255.0), 0, 255) * 3
 		
-		# Clamp to image bounds
-		img_x = clampi(img_x, 0, image_size - 1)
-		img_y = clampi(img_y, 0, image_size - 1)
+		# Get RGB from pre-computed LUT
+		var r: int = lut[lut_idx]
+		var g: int = lut[lut_idx + 1]
+		var b: int = lut[lut_idx + 2]
 		
-		# Normalize intensity and apply gamma
-		var norm_intensity: float = (intensity - i_min) / i_range
-		norm_intensity = pow(norm_intensity, intensity_gamma)
-		norm_intensity = clamp(norm_intensity, 0.0, 1.0)
+		# Draw 2x2 pixel block directly to byte array
+		var base_idx: int = img_y * row_stride + img_x * 3
+		pixels[base_idx] = r
+		pixels[base_idx + 1] = g
+		pixels[base_idx + 2] = b
 		
-		# Apply colormap
-		var color: Color = _get_colormap_color(norm_intensity)
+		if img_x + 1 <= max_coord:
+			pixels[base_idx + 3] = r
+			pixels[base_idx + 4] = g
+			pixels[base_idx + 5] = b
 		
-		# Set pixel (and neighbors for larger dots)
-		_set_pixel_safe(img, img_x, img_y, color)
-		_set_pixel_safe(img, img_x + 1, img_y, color)
-		_set_pixel_safe(img, img_x, img_y + 1, color)
-		_set_pixel_safe(img, img_x + 1, img_y + 1, color)
-		pixels_drawn += 1
-		
-		# Debug first few pixels
-		if _should_debug and pixels_drawn <= 3:
-			print("Pixel #%d: dbs=(%.1f,%.1f) -> img=(%d,%d), intensity=%.2f, color=%s" % [
-				pixels_drawn, dbs_x, dbs_y, img_x, img_y, norm_intensity, color
-			])
+		if img_y + 1 <= max_coord:
+			var next_row: int = base_idx + row_stride
+			pixels[next_row] = r
+			pixels[next_row + 1] = g
+			pixels[next_row + 2] = b
+			
+			if img_x + 1 <= max_coord:
+				pixels[next_row + 3] = r
+				pixels[next_row + 4] = g
+				pixels[next_row + 5] = b
 	
-	if _should_debug:
-		print("RENDER %s: Drew %d pixels total" % [label, pixels_drawn])
-	
-	tex.update(img)
-
-func _set_pixel_safe(img: Image, x: int, y: int, color: Color) -> void:
-	if x >= 0 and x < image_size and y >= 0 and y < image_size:
-		# Blend with existing pixel (take brighter)
-		var existing: Color = img.get_pixel(x, y)
-		if color.get_luminance() > existing.get_luminance():
-			img.set_pixel(x, y, color)
+	return pixels
 
 func _get_colormap_color(t: float) -> Color:
 	match colormap:
