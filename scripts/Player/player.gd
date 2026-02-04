@@ -84,7 +84,7 @@ func _adjust_radar_beam_width(delta: float):
 	
 	# Adjust beam width by delta degrees
 	var current_width = radar_node.beam_width_deg
-	var new_width = clamp(current_width + delta, 2.0, 60.0)
+	var new_width = clamp(current_width + delta, 0.5, 180.0)
 	radar_node.beam_width_deg = new_width
 	print("Beam width: %.1f°" % new_width)
 

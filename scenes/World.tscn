@@ -6,6 +6,7 @@
 [ext_resource type="Texture2D" uid="uid://blkmvds4ww5ou" path="res://assets/heightmaps/Terrain004_2K.exr" id="3_hlk0d"]
 [ext_resource type="Script" uid="uid://cv6ga0vx446rt" path="res://scenes/node_3d_dbs.gd" id="5_1lgw5"]
 [ext_resource type="PackedScene" uid="uid://b88om4olisdsu" path="res://scene.gltf" id="6_hlk0d"]
+[ext_resource type="Script" uid="uid://blna05w6mg8o1" path="res://scripts/radar_material.gd" id="7_0uv0p"]
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_io8um"]
 sky_top_color = Color(0.223529, 0.521569, 1, 1)
@@ -105,9 +106,12 @@ script = ExtResource("5_1lgw5")
 
 [node name="Sketchfab_Scene" parent="." unique_id=1657266677 instance=ExtResource("6_hlk0d")]
 transform = Transform3D(0.99375623, -0.107259445, -0.030723736, 0.111573, 0.95533633, 0.27364957, -3.6660222e-09, -0.27536893, 0.96133876, 38.932705, 26.187382, -17.016373)
+metadata/radar_specular = true
+metadata/radar_rcs = 5.0
 
 [node name="Sketchfab_Scene2" parent="." unique_id=1517180200 instance=ExtResource("6_hlk0d")]
 transform = Transform3D(0.991558, -0.12117502, 0.046142902, 0.11038813, 0.9755866, 0.18985672, -0.06802229, -0.18316038, 0.98072714, 40.50463, 24.091183, -28.350637)
 
 [node name="Sketchfab_Scene3" parent="." unique_id=57203217 instance=ExtResource("6_hlk0d")]
 transform = Transform3D(0.9937951, 0.109662674, 0.018583491, -0.11122611, 0.9798259, 0.16604179, 0, -0.1670785, 0.9859436, 47.737507, 24.893137, -22.884281)
+script = ExtResource("7_0uv0p")

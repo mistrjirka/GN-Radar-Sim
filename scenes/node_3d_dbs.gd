@@ -44,11 +44,12 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 @export var enable_speckle: bool = true              ## Enable speckle noise
 
 @export_category("Surface Properties")
-@export var cube_height_threshold: float = 55.0      ## Height above which is considered "cube" (specular)
-@export var specular_exponent: float = 6.0           ## Specular reflection sharpness
-@export var specular_multiplier: float = 15.0        ## Specular intensity multiplier
-@export var diffuse_base: float = 0.1                ## Base diffuse intensity
-@export var diffuse_multiplier: float = 0.5          ## Diffuse intensity multiplier
+@export var cube_height_threshold: float = 55.0      ## Height above which is considered "cube" (specular) - fallback only
+@export var specular_exponent: float = 6.0           ## Specular reflection sharpness (default)
+@export var specular_multiplier: float = 15.0        ## Specular intensity multiplier (default)
+@export var diffuse_base: float = 0.1                ## Base diffuse intensity (default)
+@export var diffuse_multiplier: float = 0.5          ## Diffuse intensity multiplier (default)
+## Metadata keys on colliders: radar_rcs (float), radar_specular (bool), radar_specular_exp (float)
 
 @export_category("Physics")
 @export var collision_mask: int = 0xFFFFFFFF
@@ -97,6 +98,7 @@ var _total_rays: int = 0                    # Total rays in current scan
 var _scan_start_time: float = 0.0           # Time when scan started
 var _last_fps: float = 60.0                 # Last measured FPS for auto-adjustment
 var _scan_max_range: float = 0.0            # Max ray distance for current scan
+var _debug_printed_nodes: Dictionary        # Track nodes already printed this scan
 
 # Reusable ray query object (avoid per-ray allocation)
 var _ray_query: PhysicsRayQueryParameters3D
@@ -223,6 +225,7 @@ func _start_new_scan() -> void:
 	_rb_data.clear()
 	_ray_directions.clear()
 	_current_ray_index = 0
+	_debug_printed_nodes = {}  # Reset debug tracking
 	
 	_scan_radar_pos = global_transform.origin
 	_scan_vel_dir = _get_velocity_direction().normalized()
@@ -298,7 +301,7 @@ func _process_dbs_scan_chunk() -> void:
 		
 		var hit: Dictionary = space_state.intersect_ray(_ray_query)
 		if not hit.is_empty():
-			_process_ray_hit(hit["position"], hit["normal"])
+			_process_ray_hit(hit["position"], hit["normal"], hit["collider"])
 		
 		_current_ray_index += 1
 	
@@ -306,7 +309,7 @@ func _process_dbs_scan_chunk() -> void:
 	if _current_ray_index >= total:
 		_finalize_scan()
 
-func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3) -> void:
+func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3, collider: Object) -> void:
 	"""Process a single ray hit and add to data buffers"""
 	var rel_pos: Vector3 = hit_point - _scan_radar_pos
 	var dist: float = rel_pos.length()
@@ -315,15 +318,84 @@ func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3) -> void:
 	# Incidence angle
 	var incidence: float = abs(view_dir.dot(hit_normal.normalized()))
 	
-	var intensity: float
-	var is_cube: bool = hit_point.y > cube_height_threshold
+	# Get reflectivity properties from collider metadata (or use defaults)
+	var rcs_mult: float = 1.0      # Radar Cross Section multiplier
+	var is_specular: bool = false  # Specular vs diffuse
+	var spec_exp: float = specular_exponent
+	var found_meta: bool = false
+	var meta_source_name: String = ""
 	
-	if is_cube:
-		intensity = pow(incidence, specular_exponent) * specular_multiplier
+	if collider != null and collider is Node:
+		var node: Node = collider as Node
+		
+		# First check directly on collider (RadarMaterial script sets it here)
+		if node.has_meta("radar_rcs"):
+			rcs_mult = node.get_meta("radar_rcs")
+			found_meta = true
+			meta_source_name = node.name
+		if node.has_meta("radar_specular"):
+			is_specular = node.get_meta("radar_specular")
+			found_meta = true
+			meta_source_name = node.name
+		if node.has_meta("radar_specular_exp"):
+			spec_exp = node.get_meta("radar_specular_exp")
+			found_meta = true
+			meta_source_name = node.name
+		
+		# If not found on collider, check parents (up to 3 levels)
+		if not found_meta:
+			var parent: Node = node.get_parent()
+			for i in range(3):
+				if parent == null:
+					break
+				if parent.has_meta("radar_rcs"):
+					rcs_mult = parent.get_meta("radar_rcs")
+					found_meta = true
+					meta_source_name = parent.name
+				if parent.has_meta("radar_specular"):
+					is_specular = parent.get_meta("radar_specular")
+					found_meta = true
+					meta_source_name = parent.name
+				if parent.has_meta("radar_specular_exp"):
+					spec_exp = parent.get_meta("radar_specular_exp")
+					found_meta = true
+					meta_source_name = parent.name
+				if found_meta:
+					break
+				parent = parent.get_parent()
+		
+		# Also check groups for convenience
+		if node.is_in_group("radar_specular"):
+			is_specular = true
+			found_meta = true
+		if node.is_in_group("radar_stealth"):
+			rcs_mult = 0.1
+			found_meta = true
+		if node.is_in_group("radar_bright"):
+			rcs_mult = 5.0
+			found_meta = true
+		
+		# Debug: print when we detect metadata/groups (once per node per scan)
+		if found_meta:
+			var node_id: int = node.get_instance_id()
+			if not _debug_printed_nodes.has(node_id):
+				_debug_printed_nodes[node_id] = true
+				print("  [RADAR] '%s' (from '%s') rcs=%.2f spec=%s exp=%.1f" % [node.name, meta_source_name, rcs_mult, is_specular, spec_exp])
+	
+	if not found_meta:
+		# Fallback to height-based detection
+		is_specular = hit_point.y > cube_height_threshold
+	
+	var intensity: float
+	if is_specular:
+		intensity = pow(incidence, spec_exp) * specular_multiplier
 		if hit_normal.y > 0.8:
 			intensity = max(intensity, 2.0)
 	else:
 		intensity = diffuse_base + incidence * diffuse_multiplier
+	
+	# Apply RCS multiplier
+	intensity *= rcs_mult
 	
 	if enable_speckle:
 		intensity *= randf_range(0.5, 1.5)
