@@ -4,7 +4,7 @@
 extends Node3D
 
 @export_category("Aircraft Movement")
-@export var velocity_mps: float = 200.0              ## Aircraft velocity in m/s (flight direction is +Y)
+@export var velocity_mps: float = 200.0              ## Aircraft movement velocity in m/s
 @export var orbit_radius: float = 150.0              ## Radius of circular orbit around target (closer to middle)
 @export var orbit_altitude: float = 100.0            ## Constant altitude above map_center.y
 @export var enable_movement: bool = false            ## Toggle movement
@@ -15,6 +15,7 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 @export_category("Radar Parameters")
 @export var wavelength_m: float = 0.03               ## X-band ~3cm wavelength
 @export var beam_width_deg: float = 17.0             ## Beam width for ~40x40m scan area
+@export var dbs_velocity_mps: float = 500.0          ## Velocity used for DBS Doppler calculation (can differ from movement)
 
 @export_category("Raycasting Resolution")
 @export var azimuth_count: int = 500                 ## Number of rays in azimuth
@@ -98,6 +99,8 @@ var _total_rays: int = 0                    # Total rays in current scan
 var _scan_start_time: float = 0.0           # Time when scan started
 var _last_fps: float = 60.0                 # Last measured FPS for auto-adjustment
 var _scan_max_range: float = 0.0            # Max ray distance for current scan
+var _scan_dbs_velocity: float = 0.0         # DBS velocity locked at scan start
+var _scan_beam_width: float = 0.0           # Beam width locked at scan start
 var _debug_printed_nodes: Dictionary        # Track nodes already printed this scan
 
 # Reusable ray query object (avoid per-ray allocation)
@@ -220,17 +223,21 @@ func _process(delta: float) -> void:
 		_draw_debug()
 
 func _start_new_scan() -> void:
-	"""Initialize a new scan cycle"""
+	"""Initialize a new scan cycle - locks all parameters for duration of scan"""
 	_dbs_data.clear()
 	_rb_data.clear()
 	_ray_directions.clear()
 	_current_ray_index = 0
 	_debug_printed_nodes = {}  # Reset debug tracking
 	
+	# LOCK all scan parameters at start - these won't change during the scan
+	# This prevents smearing when aircraft moves during multi-frame scan
 	_scan_radar_pos = global_transform.origin
 	_scan_vel_dir = _get_velocity_direction().normalized()
+	_scan_dbs_velocity = dbs_velocity_mps  # Use DBS velocity, not movement velocity
+	_scan_beam_width = beam_width_deg
 	
-	# Calculate beam direction toward target
+	# Calculate beam direction toward target (locked for this scan)
 	var vec_to_target: Vector3 = map_center - _scan_radar_pos
 	_scan_dist_to_center = vec_to_target.length()
 	
@@ -400,12 +407,12 @@ func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3, collider: Object)
 	if enable_speckle:
 		intensity *= randf_range(0.5, 1.5)
 	
-	# DBS math
+	# DBS math - use locked scan parameters for consistency
 	var cos_theta: float = view_dir.dot(_scan_vel_dir)
-	var doppler: float = (2.0 * velocity_mps * cos_theta) / wavelength_m
+	var doppler: float = (2.0 * _scan_dbs_velocity * cos_theta) / wavelength_m
 	var fd_meas: float = doppler + randfn(0.0, doppler_noise_std)
 	
-	var val: float = clamp((fd_meas * wavelength_m) / (2.0 * velocity_mps), -1.0, 1.0)
+	var val: float = clamp((fd_meas * wavelength_m) / (2.0 * _scan_dbs_velocity), -1.0, 1.0)
 	var meas_az_dbs: float = acos(val)
 	
 	var right_vec: Vector3 = _scan_vel_dir.cross(Vector3.UP).normalized()
@@ -415,12 +422,12 @@ func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3, collider: Object)
 	var dbs_x: float = dist * sin(meas_az_dbs)
 	var dbs_y: float = dist * cos(meas_az_dbs)
 	
-	# Real Beam
+	# Real Beam - use locked beam width for consistency
 	var true_az_vel: float = acos(clamp(cos_theta, -1.0, 1.0))
 	if rel_pos.dot(right_vec) < 0.0:
 		true_az_vel = -true_az_vel
 	
-	var beam_noise: float = randfn(0.0, deg_to_rad(beam_width_deg / 2.0))
+	var beam_noise: float = randfn(0.0, deg_to_rad(_scan_beam_width / 2.0))
 	var meas_az_rb: float = true_az_vel + beam_noise
 	
 	var rb_x: float = dist * sin(meas_az_rb)
@@ -722,12 +729,27 @@ func _draw_debug() -> void:
 	_dbg_mesh.clear_surfaces()
 	_dbg_mesh.surface_begin(Mesh.PRIMITIVE_LINES)
 	
-	var origin: Vector3 = global_transform.origin
+	# Use LOCKED scan position during scan, otherwise current position
+	var origin: Vector3
+	var vel_dir: Vector3
+	var beam_width: float
+	
+	if _scan_in_progress or _render_pending:
+		# During scan: draw from locked position
+		origin = _scan_radar_pos
+		vel_dir = _scan_vel_dir
+		beam_width = _scan_beam_width
+	else:
+		# No scan: draw from current position
+		origin = global_transform.origin
+		vel_dir = _get_velocity_direction()
+		beam_width = beam_width_deg
+	
 	var to_target: Vector3 = map_center - origin
 	var dist_to_center: float = to_target.length()
 	
 	var beam_center: Vector3 = _beam_dir
-	var half_beam_rad: float = deg_to_rad(beam_width_deg * 0.5)
+	var half_beam_rad: float = deg_to_rad(beam_width * 0.5)
 	
 	# Find perpendicular axes
 	var up_approx: Vector3 = Vector3.UP
@@ -765,10 +787,20 @@ func _draw_debug() -> void:
 	_dbg_mesh.surface_add_vertex(origin)
 	_dbg_mesh.surface_add_vertex(map_center)
 	
-	# Velocity vector (cyan)
-	var vel_dir: Vector3 = _get_velocity_direction()
+	# Velocity vector (cyan) - use locked vel_dir during scan
 	_dbg_mesh.surface_set_color(Color(0.0, 1.0, 1.0, 1.0))
 	_dbg_mesh.surface_add_vertex(origin)
-	_dbg_mesh.surface_add_vertex(origin + vel_dir * velocity_mps * 0.5)
+	_dbg_mesh.surface_add_vertex(origin + vel_dir * dbs_velocity_mps * 0.5)
+	
+	# Also draw current aircraft position if different (white, small)
+	if _scan_in_progress or _render_pending:
+		var current_pos: Vector3 = global_transform.origin
+		_dbg_mesh.surface_set_color(Color(1.0, 1.0, 1.0, 0.5))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(-2, 0, 0))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(2, 0, 0))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(0, -2, 0))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(0, 2, 0))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(0, 0, -2))
+		_dbg_mesh.surface_add_vertex(current_pos + Vector3(0, 0, 2))
 	
 	_dbg_mesh.surface_end()

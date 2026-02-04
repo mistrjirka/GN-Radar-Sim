@@ -103,6 +103,8 @@ mesh = SubResource("PlaneMesh_0uv0p")
 [node name="Node3D" type="Node3D" parent="." unique_id=1920606467]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -763.8683, 226.3287, 10.114821)
 script = ExtResource("5_1lgw5")
+velocity_mps = 20.0
+enable_movement = true
 
 [node name="Sketchfab_Scene" parent="." unique_id=1657266677 instance=ExtResource("6_hlk0d")]
 transform = Transform3D(0.99375623, -0.107259445, -0.030723736, 0.111573, 0.95533633, 0.27364957, -3.6660222e-09, -0.27536893, 0.96133876, 38.932705, 26.187382, -17.016373)
