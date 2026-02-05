@@ -15,8 +15,19 @@ signal chunk_unloaded(chunk_pos: Vector2i)
 @export var unload_radius: float = 2500.0        ## Distance to unload chunks (hysteresis)
 @export var heightmap_resolution: int = 65       ## Samples per chunk side (power of 2 + 1)
 
+@export_category("LOD Settings")
+@export var enable_lod: bool = true              ## Enable dynamic resolution based on beam width
+@export var min_resolution: int = 33             ## Resolution for wide beams (low detail)
+@export var max_resolution: int = 257            ## Resolution for narrow beams (high detail)
+@export var beam_width_for_min_res: float = 30.0 ## Beam width (deg) where min resolution is used
+@export var beam_width_for_max_res: float = 2.0  ## Beam width (deg) where max resolution is used
+
+var _current_lod_resolution: int = 65            ## Currently active resolution
+var _last_beam_width: float = 17.0               ## Last beam width used
+
 @export_category("Target")
 @export var target_node_path: NodePath           ## Node to follow (aircraft)
+var target_node: Node3D = null                   ## Direct reference (set via code)
 
 @export_category("Performance")
 @export var chunks_per_frame: int = 1            ## Max chunks to generate per frame
@@ -35,16 +46,75 @@ var _target_chunk: Vector2i = Vector2i.ZERO      ## Current chunk the target is 
 
 func _ready() -> void:
 	_terrain = ProceduralTerrainClass.new(terrain_seed)
+	_current_lod_resolution = heightmap_resolution
 	
-	if target_node_path:
+	# Try direct reference first, then path
+	if target_node:
+		_target = target_node
+		print("[TerrainChunkManager] Using direct target reference: ", _target.name)
+	elif target_node_path:
 		_target = get_node_or_null(target_node_path)
+		if _target:
+			print("[TerrainChunkManager] Resolved target from path: ", _target.name)
 	
 	if not _target:
 		push_warning("[TerrainChunkManager] No target node set - terrain won't update")
+	else:
+		print("[TerrainChunkManager] Target position: ", _target.global_position)
 
 func get_terrain() -> ProceduralTerrainClass:
 	"""Get the terrain height function for object placement"""
 	return _terrain
+
+func set_beam_width(beam_width_deg: float) -> void:
+	"""Update terrain LOD based on radar beam width.
+	Narrower beam = higher resolution terrain collision.
+	Call this when beam_width_deg changes (e.g., on scroll wheel zoom)."""
+	if not enable_lod:
+		return
+	
+	_last_beam_width = beam_width_deg
+	
+	# Calculate target resolution using inverse lerp + lerp
+	# Narrow beam (small value) -> high resolution
+	# Wide beam (large value) -> low resolution
+	var t: float = inverse_lerp(beam_width_for_max_res, beam_width_for_min_res, beam_width_deg)
+	t = clamp(t, 0.0, 1.0)
+	
+	# Lerp between max and min resolution (note: inverted because narrow = high res)
+	var target_res_float: float = lerp(float(max_resolution), float(min_resolution), t)
+	
+	# Snap to nearest power of 2 + 1 for HeightMapShape3D compatibility
+	var target_res: int = _snap_to_valid_resolution(int(target_res_float))
+	
+	# Only regenerate if resolution changed significantly
+	if target_res != _current_lod_resolution:
+		print("[TerrainChunkManager] LOD change: beam=%.1f° -> resolution %d (was %d)" % [beam_width_deg, target_res, _current_lod_resolution])
+		_current_lod_resolution = target_res
+		_regenerate_all_chunks()
+
+func _snap_to_valid_resolution(res: int) -> int:
+	"""Snap resolution to nearest (power of 2) + 1 for HeightMapShape3D"""
+	# Valid values: 3, 5, 9, 17, 33, 65, 129, 257, 513, ...
+	var valid: Array[int] = [17, 33, 65, 129, 257, 513]
+	var best: int = valid[0]
+	var best_diff: int = abs(res - best)
+	
+	for v in valid:
+		var diff: int = abs(res - v)
+		if diff < best_diff:
+			best = v
+			best_diff = diff
+	
+	return best
+
+func get_current_resolution() -> int:
+	"""Get the currently active heightmap resolution"""
+	return _current_lod_resolution
+
+func get_meters_per_sample() -> float:
+	"""Get terrain resolution in meters per heightmap sample"""
+	return chunk_size / float(_current_lod_resolution - 1)
 
 func set_terrain_params(params: Dictionary) -> void:
 	"""Configure terrain noise parameters"""
@@ -163,16 +233,19 @@ func _generate_chunk(chunk_pos: Vector2i) -> void:
 	"""Generate a collision-only terrain chunk"""
 	var chunk_center: Vector3 = _chunk_to_world_center(chunk_pos)
 	
+	# Use current LOD resolution (dynamically adjusted based on beam width)
+	var res: int = _current_lod_resolution
+	
 	# Generate heightmap data
 	var height_data: PackedFloat32Array = _terrain.sample_heightmap(
 		chunk_center.x, chunk_center.z,
-		chunk_size, heightmap_resolution
+		chunk_size, res
 	)
 	
 	# Create HeightMapShape3D
 	var shape: HeightMapShape3D = HeightMapShape3D.new()
-	shape.map_width = heightmap_resolution
-	shape.map_depth = heightmap_resolution
+	shape.map_width = res
+	shape.map_depth = res
 	shape.map_data = height_data
 	
 	# Create collision shape
@@ -180,7 +253,7 @@ func _generate_chunk(chunk_pos: Vector2i) -> void:
 	collision.shape = shape
 	
 	# Scale to match world size (HeightMapShape3D is 1 unit per sample)
-	var scale_factor: float = chunk_size / float(heightmap_resolution - 1)
+	var scale_factor: float = chunk_size / float(res - 1)
 	collision.scale = Vector3(scale_factor, 1.0, scale_factor)
 	
 	# Position at chunk corner (HeightMapShape3D starts at origin)
@@ -205,6 +278,7 @@ func _generate_chunk(chunk_pos: Vector2i) -> void:
 	add_child(body)
 	
 	_chunks[chunk_pos] = body
+	print("[TerrainChunkManager] Generated chunk ", chunk_pos, " at ", chunk_center, " (res=%d, %.1fm/sample)" % [res, chunk_size / float(res - 1)])
 	emit_signal("chunk_loaded", chunk_pos)
 
 func _unload_chunk(chunk_pos: Vector2i) -> void:

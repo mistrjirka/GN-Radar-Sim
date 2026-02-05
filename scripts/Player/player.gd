@@ -17,11 +17,13 @@ var yaw: float = 0.0
 
 # Reference to the radar node (will be found at runtime)
 var radar_node: Node3D = null
+var terrain_manager: Node3D = null
 
 func _ready():
 	Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
 	# Find the radar node in the scene (the Node3D with DBS script)
 	call_deferred("_find_radar_node")
+	call_deferred("_find_terrain_manager")
 
 func _find_radar_node():
 	# Look for a node with the 'map_center' property (the DBS radar)
@@ -40,6 +42,14 @@ func _find_node_with_property(node: Node, property_name: String) -> Node:
 		if result:
 			return result
 	return null
+
+func _find_terrain_manager():
+	var root = get_tree().current_scene
+	terrain_manager = _find_node_with_property(root, "chunk_size")
+	if terrain_manager:
+		print("Terrain manager found: ", terrain_manager.name)
+	else:
+		print("INFO: No terrain manager found (optional)")
 
 func _input(event):
 	if event is InputEventMouseMotion:
@@ -87,6 +97,10 @@ func _adjust_radar_beam_width(delta: float):
 	var new_width = clamp(current_width + delta, 0.5, 180.0)
 	radar_node.beam_width_deg = new_width
 	print("Beam width: %.1f°" % new_width)
+	
+	# Update terrain LOD if available
+	if terrain_manager and terrain_manager.has_method("set_beam_width"):
+		terrain_manager.set_beam_width(new_width)
 
 var mouse_mode_captured : bool = true
 

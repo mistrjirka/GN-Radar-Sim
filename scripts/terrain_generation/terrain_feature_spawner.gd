@@ -26,6 +26,8 @@ signal feature_despawned(feature: Node3D)
 @export_category("Target")
 @export var target_node_path: NodePath           ## Node to follow (aircraft) 
 @export var terrain_manager_path: NodePath       ## Path to TerrainChunkManager
+var target_node: Node3D = null                   ## Direct reference (set via code)
+var terrain_manager_node: Node3D = null          ## Direct reference (set via code)
 
 @export_category("Radar Properties")
 @export var default_radar_rcs: float = 2.0       ## Default RCS for spawned features
@@ -49,10 +51,17 @@ func _ready() -> void:
 	_rng = RandomNumberGenerator.new()
 	_rng.seed = spawn_seed
 	
-	if target_node_path:
+	# Try direct references first, then paths
+	if target_node:
+		_target = target_node
+	elif target_node_path:
 		_target = get_node_or_null(target_node_path)
 	
-	if terrain_manager_path:
+	if terrain_manager_node:
+		_terrain_manager = terrain_manager_node
+		if _terrain_manager:
+			_terrain = _terrain_manager.get_terrain()
+	elif terrain_manager_path:
 		_terrain_manager = get_node_or_null(terrain_manager_path)
 		if _terrain_manager:
 			_terrain = _terrain_manager.get_terrain()

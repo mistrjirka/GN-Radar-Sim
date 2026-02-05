@@ -7,7 +7,7 @@ class_name ProceduralTerrainSetup
 @export var terrain_seed: int = 42
 @export var chunk_size: float = 256.0
 @export var load_radius: float = 2000.0
-@export var heightmap_resolution: int = 65
+@export var heightmap_resolution: int = 130
 
 ## Feature library - add PackedScene resources here
 @export var feature_scenes: Array[PackedScene] = []
@@ -35,8 +35,10 @@ func _setup_terrain() -> void:
 	_chunk_manager.chunk_size = chunk_size
 	_chunk_manager.load_radius = load_radius
 	_chunk_manager.heightmap_resolution = heightmap_resolution
-	_chunk_manager.target_node_path = _chunk_manager.get_path_to(aircraft)
+	# Use direct node reference instead of path (path doesn't work before add_child)
+	_chunk_manager.target_node = aircraft
 	add_child(_chunk_manager)
+	print("[ProceduralTerrainSetup] Aircraft found: ", aircraft.name, " at ", aircraft.global_position)
 	
 	# Wait for chunk manager to initialize
 	await get_tree().process_frame
@@ -48,8 +50,9 @@ func _setup_terrain() -> void:
 		_feature_spawner.name = "FeatureSpawner"
 		_feature_spawner.feature_scenes = feature_scenes
 		_feature_spawner.spawn_density = feature_density
-		_feature_spawner.target_node_path = _feature_spawner.get_path_to(aircraft)
-		_feature_spawner.terrain_manager_path = _feature_spawner.get_path_to(_chunk_manager)
+		# Use direct references
+		_feature_spawner.target_node = aircraft
+		_feature_spawner.terrain_manager_node = _chunk_manager
 		add_child(_feature_spawner)
 	
 	print("[ProceduralTerrainSetup] Terrain system ready!")
