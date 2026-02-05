@@ -37,6 +37,7 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 @export var display_range_x: Vector2 = Vector2(-250, 250)  ## DBS X display range
 @export var display_range_y: Vector2 = Vector2(-250, 250)  ## DBS Y display range
 @export var auto_fit_range: bool = true              ## Auto-fit display range to data
+@export var preserve_aspect_ratio: bool = true       ## Keep physical proportions on display
 @export var colormap: int = 0                        ## 0=Inferno, 1=Green, 2=Grayscale
 @export var intensity_gamma: float = 0.5             ## Gamma correction for intensity
 
@@ -587,6 +588,17 @@ func _compute_pixels_only(data: PackedVector3Array) -> PackedByteArray:
 	var i_range: float = maxf(i_max - i_min, 0.001)
 	var x_scale: float = float(image_size - 1) / x_range
 	var y_scale: float = float(image_size - 1) / y_range
+	
+	# Uniform scaling: use same pixels-per-meter for both axes, center the smaller one
+	var x_offset: float = 0.0
+	var y_offset: float = 0.0
+	if preserve_aspect_ratio and x_range > 0.001 and y_range > 0.001:
+		var uniform_scale: float = minf(x_scale, y_scale)
+		x_offset = (float(image_size - 1) - x_range * uniform_scale) * 0.5
+		y_offset = (float(image_size - 1) - y_range * uniform_scale) * 0.5
+		x_scale = uniform_scale
+		y_scale = uniform_scale
+	
 	var i_scale: float = 255.0 / i_range
 	
 	# Local copy of LUT for thread safety
@@ -597,9 +609,9 @@ func _compute_pixels_only(data: PackedVector3Array) -> PackedByteArray:
 	for i in range(data_size):
 		var point: Vector3 = data[i]
 		
-		# Map to image coordinates
-		var img_x: int = clampi(int((point.x - x_min) * x_scale), 0, max_coord)
-		var img_y: int = clampi(max_coord - int((point.y - y_min) * y_scale), 0, max_coord)
+		# Map to image coordinates (with uniform offset for aspect ratio)
+		var img_x: int = clampi(int(x_offset + (point.x - x_min) * x_scale), 0, max_coord)
+		var img_y: int = clampi(max_coord - int(y_offset + (point.y - y_min) * y_scale), 0, max_coord)
 		
 		# Normalize intensity, apply gamma, and get LUT index
 		var norm: float = clampf((point.z - i_min) * i_scale / 255.0, 0.0, 1.0)
