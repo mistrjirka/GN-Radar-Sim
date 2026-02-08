@@ -61,9 +61,11 @@ size = Vector2(128, 128)
 
 [node name="Node3D2" type="Node3D" parent="." unique_id=1709599227]
 script = ExtResource("4_d1c63")
+feature_scenes = Array[PackedScene]([ExtResource("6_hlk0d")])
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="." unique_id=1818822539]
-transform = Transform3D(-0.866025, -0.433013, 0.25, 0, 0.5, 0.866025, -0.5, 0.75, -0.433013, 0, 0, 0)
+transform = Transform3D(-0.8660253, -0.4330129, 0.2500001, 0, 0.49999994, 0.86602545, -0.50000024, 0.74999994, -0.43301257, 0, 11.660783, 0)
+light_energy = 1.634
 shadow_enabled = true
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1647099817]
@@ -71,6 +73,9 @@ environment = SubResource("Environment_io8um")
 
 [node name="CharacterBody3D" parent="." unique_id=1057580769 instance=ExtResource("2_32lhk")]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -22.431625, 130.10849, 50.548164)
+
+[node name="OmniLight3D" type="OmniLight3D" parent="CharacterBody3D" unique_id=419415284]
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2.568222, 0)
 
 [node name="MeshInstance3D" type="MeshInstance3D" parent="." unique_id=1700046886]
 transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 6, 0)
@@ -83,14 +88,4 @@ transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, -763.8683, 226.3287, 10.11482
 script = ExtResource("5_1lgw5")
 velocity_mps = 20.0
 enable_movement = true
-
-[node name="Sketchfab_Scene" parent="." unique_id=1657266677 instance=ExtResource("6_hlk0d")]
-transform = Transform3D(0.99375623, -0.107259445, -0.030723736, 0.111573, 0.95533633, 0.27364957, -3.6660222e-09, -0.27536893, 0.96133876, 38.932705, 26.187382, -17.016373)
-metadata/radar_specular = true
-metadata/radar_rcs = 5.0
-
-[node name="Sketchfab_Scene2" parent="." unique_id=1517180200 instance=ExtResource("6_hlk0d")]
-transform = Transform3D(0.991558, -0.12117502, 0.046142902, 0.11038813, 0.9755866, 0.18985672, -0.06802229, -0.18316038, 0.98072714, 40.50463, 24.091183, -28.350637)
-
-[node name="Sketchfab_Scene3" parent="." unique_id=57203217 instance=ExtResource("6_hlk0d")]
-transform = Transform3D(0.9937951, 0.109662674, 0.018583491, -0.11122611, 0.9798259, 0.16604179, 0, -0.1670785, 0.9859436, 47.737507, 24.893137, -22.884281)
+accumulate_mode = 1

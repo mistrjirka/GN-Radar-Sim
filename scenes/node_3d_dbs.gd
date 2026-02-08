@@ -28,6 +28,8 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 
 @export_category("Map Area")
 @export var map_center: Vector3 = Vector3.ZERO       ## Center of target area (where beam aims)
+@export var target_area_from_beam: bool = true       ## Auto-compute target area from beam footprint
+@export var target_area_size: float = 40.0           ## Manual override (used when target_area_from_beam is false)
 
 @export_category("Image")
 @export var image_size: int = 512                    ## Square image size
@@ -38,6 +40,8 @@ var _orbit_angle: float = 0.0                        ## Current angle in radians
 @export var display_range_y: Vector2 = Vector2(-250, 250)  ## DBS Y display range
 @export var auto_fit_range: bool = true              ## Auto-fit display range to data
 @export var preserve_aspect_ratio: bool = true       ## Keep physical proportions on display
+@export var accumulate_scans: int = 20                ## Number of scans to accumulate (1=no accumulation)
+@export_enum("Median", "Average") var accumulate_mode: int = 0  ## 0=Median (noise-robust), 1=Average (smoother)
 @export var colormap: int = 0                        ## 0=Inferno, 1=Green, 2=Grayscale
 @export var intensity_gamma: float = 0.5             ## Gamma correction for intensity
 
@@ -72,6 +76,14 @@ var _tex_rb: ImageTexture     # Real Beam texture
 var _ui_layer: CanvasLayer
 var _ui_rect: TextureRect
 var _ui_rect_rb: TextureRect  # Real Beam display
+var _countdown_label: Label   # Scan countdown / ETA
+var _scale_label_rb: Label    # RB scale indicator
+var _scale_label_dbs: Label   # DBS scale indicator
+var _lod_label: Label         # Current LOD resolution display
+var _chunk_manager: Node3D    # Reference to TerrainChunkManager for LOD
+var _loading_overlay: ColorRect  # Loading screen overlay
+var _loading_label: Label     # Loading screen text
+var _waiting_for_terrain: bool = false  # Waiting for terrain chunks to reach target resolution
 
 # DBS data buffer: Array of [dbs_x, dbs_y, intensity]
 var _dbs_data: PackedVector3Array
@@ -121,6 +133,18 @@ var _task_rb: int = -1
 var _pixels_dbs: PackedByteArray
 var _pixels_rb: PackedByteArray
 
+# --- Scan accumulation ring buffers ---
+var _accum_dbs: Array[PackedByteArray] = []
+var _accum_rb: Array[PackedByteArray] = []
+var _task_median: int = -1
+var _median_pending: bool = false
+var _median_result_dbs: PackedByteArray
+var _median_result_rb: PackedByteArray
+
+# --- Target change tracking ---
+var _prev_map_center: Vector3 = Vector3.ZERO
+var _prev_beam_width: float = 0.0
+
 func _ready() -> void:
 	_build_colormap_lut()
 	_build_background_pixels()
@@ -151,10 +175,43 @@ func _ready() -> void:
 	
 	_create_debug()
 	call_deferred("_attach_ui")
+	call_deferred("_find_chunk_manager")
 	
 	print("DBS Radar initialized at position: ", global_transform.origin)
 	print("Aiming at map_center: ", map_center)
 	print("Performance: rays_per_frame = ", rays_per_frame)
+	_prev_map_center = map_center
+	_prev_beam_width = beam_width_deg
+
+func _find_chunk_manager() -> void:
+	"""Find TerrainChunkManager in scene tree for LOD updates."""
+	# TerrainChunkManager is created at runtime by ProceduralTerrainSetup.
+	# Wait several frames for the deferred setup to complete.
+	for _i in range(5):
+		await get_tree().process_frame
+		var root: Node = get_tree().current_scene
+		if root:
+			_chunk_manager = _find_node_by_class(root, "TerrainChunkManager")
+		if _chunk_manager:
+			print("[RADAR] Found TerrainChunkManager for LOD updates")
+			_chunk_manager.set_beam_width(beam_width_deg)
+			# If terrain already loaded (tiny maps), hide overlay immediately
+			if _loading_overlay and _chunk_manager.is_initial_load_done():
+				_loading_overlay.visible = false
+			return
+	# No chunk manager found — hide overlay (nothing to wait for)
+	if _loading_overlay:
+		_loading_overlay.visible = false
+	print("[RADAR] No TerrainChunkManager found (LOD disabled)")
+
+func _find_node_by_class(node: Node, cls: String) -> Node3D:
+	if node.get_class() == cls or (node.get_script() and node.get_script().get_global_name() == cls):
+		return node
+	for child in node.get_children():
+		var found := _find_node_by_class(child, cls)
+		if found:
+			return found
+	return null
 
 func _update_orbit_position() -> void:
 	# Aircraft orbits around map_center at fixed radius and altitude
@@ -177,14 +234,91 @@ func _exit_tree() -> void:
 		WorkerThreadPool.wait_for_task_completion(_task_dbs)
 	if _task_rb >= 0:
 		WorkerThreadPool.wait_for_task_completion(_task_rb)
+	if _task_median >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_median)
 	if is_instance_valid(_ui_layer):
 		_ui_layer.queue_free()
+
+func set_target(new_center: Vector3) -> void:
+	"""Change the radar target. Invalidates accumulated scans and repositions."""
+	map_center = new_center
+	_invalidate_scans()
+
+func _invalidate_scans() -> void:
+	"""Clear all accumulated data and abort current scan"""
+	# Wait for any in-flight worker tasks to finish before clearing their data
+	if _task_dbs >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_dbs)
+		_task_dbs = -1
+	if _task_rb >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_rb)
+		_task_rb = -1
+	if _task_median >= 0:
+		WorkerThreadPool.wait_for_task_completion(_task_median)
+		_task_median = -1
+	_render_pending = false
+	_median_pending = false
+	
+	_accum_dbs.clear()
+	_accum_rb.clear()
+	_dbs_data.clear()
+	_rb_data.clear()
+	# Abort current scan so next frame starts fresh
+	_scan_in_progress = false
+	_current_ray_index = 0
+	# Clear display immediately
+	if _img:
+		_img.fill(background_color)
+		_tex.update(_img)
+	if _img_rb:
+		_img_rb.fill(background_color)
+		_tex_rb.update(_img_rb)
+	_prev_map_center = map_center
+	_prev_beam_width = beam_width_deg
+	print("[RADAR] Target/beam changed — scans invalidated  center=", map_center, "  beam=", beam_width_deg)
 
 func _process(delta: float) -> void:
 	# Wait one frame for physics to be ready
 	if _first_frame:
 		_first_frame = false
 		return
+	
+	# Detect if map_center or beam width changed (e.g. via inspector or script)
+	if map_center != _prev_map_center or beam_width_deg != _prev_beam_width:
+		if _chunk_manager:
+			if beam_width_deg != _prev_beam_width:
+				_chunk_manager.set_beam_width(beam_width_deg)
+			# Update focus area to beam footprint
+			var dist_to_target: float = global_transform.origin.distance_to(map_center)
+			var footprint: float = 2.0 * dist_to_target * tan(deg_to_rad(beam_width_deg * 0.5))
+			_chunk_manager.update_focus_area(map_center.x, map_center.z, footprint * 0.5)
+		_invalidate_scans()
+		_waiting_for_terrain = true
+	
+	# Update focus area each frame (in case aircraft moves)
+	if _chunk_manager and not _waiting_for_terrain:
+		var dist_to_target: float = global_transform.origin.distance_to(map_center)
+		var footprint: float = 2.0 * dist_to_target * tan(deg_to_rad(beam_width_deg * 0.5))
+		_chunk_manager.update_focus_area(map_center.x, map_center.z, footprint * 0.5)
+	
+	# Check if terrain is ready (clear waiting flag)
+	if _waiting_for_terrain and _chunk_manager:
+		if _chunk_manager.is_focus_ready():
+			_waiting_for_terrain = false
+	
+	# Hide loading overlay when initial load is done
+	if _loading_overlay and _loading_overlay.visible:
+		if not _chunk_manager or _chunk_manager.is_initial_load_done():
+			_loading_overlay.visible = false
+		else:
+			var loaded: int = _chunk_manager.get_loaded_chunk_count()
+			var pending: int = _chunk_manager.get_pending_chunk_count()
+			_loading_label.text = "Loading terrain... %d/%d chunks" % [loaded, loaded + pending]
+	
+	# Update countdown / progress label
+	_update_countdown_label()
+	_update_scale_labels()
+	_update_lod_label()
 	
 	# Track FPS for auto-adjustment
 	if delta > 0:
@@ -248,6 +382,16 @@ func _start_new_scan() -> void:
 	
 	_beam_dir = vec_to_target.normalized()
 	
+	# Auto-compute target area from beam footprint: footprint = 2 * dist * tan(beam_width/2)
+	if target_area_from_beam:
+		target_area_size = 2.0 * _scan_dist_to_center * tan(deg_to_rad(beam_width_deg * 0.5))
+	
+	# Lock display ranges centered on map_center (coords are now world-relative to map_center)
+	var half_area: float = target_area_size * 0.5
+	display_range_x = Vector2(-half_area, half_area)
+	display_range_y = Vector2(-half_area, half_area)
+	auto_fit_range = false
+	
 	# Pre-generate all ray directions
 	var half_beam_rad: float = deg_to_rad(beam_width_deg * 0.5)
 	
@@ -281,6 +425,10 @@ func _start_new_scan() -> void:
 
 func _process_dbs_scan_chunk() -> void:
 	"""Process rays until time budget spent (prevents frame spikes)"""
+	
+	# Don't start scanning if terrain is still updating
+	if _waiting_for_terrain:
+		return
 	
 	# Start a new scan if not in progress
 	if not _scan_in_progress:
@@ -319,6 +467,11 @@ func _process_dbs_scan_chunk() -> void:
 
 func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3, collider: Object) -> void:
 	"""Process a single ray hit and add to data buffers"""
+	# Filter: only keep hits within the target area around map_center
+	var half_area: float = target_area_size * 0.5
+	if absf(hit_point.x - map_center.x) > half_area or absf(hit_point.z - map_center.z) > half_area:
+		return
+	
 	var rel_pos: Vector3 = hit_point - _scan_radar_pos
 	var dist: float = rel_pos.length()
 	var view_dir: Vector3 = rel_pos.normalized()
@@ -408,34 +561,36 @@ func _process_ray_hit(hit_point: Vector3, hit_normal: Vector3, collider: Object)
 	if enable_speckle:
 		intensity *= randf_range(0.5, 1.5)
 	
-	# DBS math - use locked scan parameters for consistency
+	# Compute angle between view direction and velocity for squint factor
 	var cos_theta: float = view_dir.dot(_scan_vel_dir)
-	var doppler: float = (2.0 * _scan_dbs_velocity * cos_theta) / wavelength_m
-	var fd_meas: float = doppler + randfn(0.0, doppler_noise_std)
 	
-	var val: float = clamp((fd_meas * wavelength_m) / (2.0 * _scan_dbs_velocity), -1.0, 1.0)
-	var meas_az_dbs: float = acos(val)
+	# Use TRUE hit position in world coords (stable across scans)
+	# Only apply cross-range perturbation from DBS/RB processing
+	var true_x: float = hit_point.x - map_center.x
+	var true_z: float = hit_point.z - map_center.z
 	
-	var right_vec: Vector3 = _scan_vel_dir.cross(Vector3.UP).normalized()
-	if rel_pos.dot(right_vec) < 0.0:
-		meas_az_dbs = -meas_az_dbs
+	# Cross-range direction: perpendicular to look direction in XZ plane
+	var look_xz: Vector3 = Vector3(rel_pos.x, 0.0, rel_pos.z).normalized()
+	var cross_dir: Vector3 = look_xz.cross(Vector3.UP).normalized()
 	
-	var dbs_x: float = dist * sin(meas_az_dbs)
-	var dbs_y: float = dist * cos(meas_az_dbs)
+	# DBS cross-range error from Doppler noise:
+	# delta_cr = lambda * R * delta_fd / (2 * V * sin(squint))
+	var doppler_noise: float = randfn(0.0, doppler_noise_std)
+	var squint_sin: float = maxf(abs(sin(acos(clamp(cos_theta, -1.0, 1.0)))), 0.1)
+	var dbs_cross_error: float = wavelength_m * dist * doppler_noise / (2.0 * _scan_dbs_velocity * squint_sin)
 	
-	# Real Beam - use locked beam width for consistency
-	var true_az_vel: float = acos(clamp(cos_theta, -1.0, 1.0))
-	if rel_pos.dot(right_vec) < 0.0:
-		true_az_vel = -true_az_vel
+	var dbs_map_x: float = true_x + cross_dir.x * dbs_cross_error
+	var dbs_map_z: float = true_z + cross_dir.z * dbs_cross_error
 	
+	# Real Beam: large cross-range smearing from beam width
 	var beam_noise: float = randfn(0.0, deg_to_rad(_scan_beam_width / 2.0))
-	var meas_az_rb: float = true_az_vel + beam_noise
+	var rb_cross_error: float = dist * beam_noise
 	
-	var rb_x: float = dist * sin(meas_az_rb)
-	var rb_y: float = dist * cos(meas_az_rb)
+	var rb_map_x: float = true_x + cross_dir.x * rb_cross_error
+	var rb_map_z: float = true_z + cross_dir.z * rb_cross_error
 	
-	_dbs_data.append(Vector3(dbs_x, dbs_y, intensity))
-	_rb_data.append(Vector3(rb_x, rb_y, intensity))
+	_dbs_data.append(Vector3(dbs_map_x, dbs_map_z, intensity))
+	_rb_data.append(Vector3(rb_map_x, rb_map_z, intensity))
 
 func _finalize_scan() -> void:
 	"""Finish scan and start parallel render tasks"""
@@ -461,33 +616,136 @@ func _finalize_scan() -> void:
 
 func _check_render_completion() -> void:
 	"""Poll render tasks and apply results on main thread when done"""
-	if not _render_pending:
+	# Stage 1: Check if pixel render tasks are done
+	if _render_pending and not _median_pending:
+		if not WorkerThreadPool.is_task_completed(_task_dbs):
+			return
+		if not WorkerThreadPool.is_task_completed(_task_rb):
+			return
+		
+		# Both pixel tasks done
+		WorkerThreadPool.wait_for_task_completion(_task_dbs)
+		WorkerThreadPool.wait_for_task_completion(_task_rb)
+		_task_dbs = -1
+		_task_rb = -1
+		
+		# Get rendered pixels
+		_render_mutex.lock()
+		var px_dbs: PackedByteArray = _pixels_dbs
+		var px_rb: PackedByteArray = _pixels_rb
+		_render_mutex.unlock()
+		
+		if accumulate_scans <= 1:
+			# No accumulation — apply directly
+			_accum_dbs.clear()
+			_accum_rb.clear()
+			_img.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_dbs)
+			_tex.update(_img)
+			_img_rb.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_rb)
+			_tex_rb.update(_img_rb)
+			_render_pending = false
+		else:
+			# Accumulate and offload median to worker thread
+			_accum_dbs.append(px_dbs)
+			_accum_rb.append(px_rb)
+			while _accum_dbs.size() > accumulate_scans:
+				_accum_dbs.remove_at(0)
+			while _accum_rb.size() > accumulate_scans:
+				_accum_rb.remove_at(0)
+			
+			# Snapshot buffers for the worker (shallow copy of array of refs is fine —
+			# we only remove_at(0) old entries, never mutate existing PackedByteArrays)
+			var snap_dbs: Array[PackedByteArray] = _accum_dbs.duplicate()
+			var snap_rb: Array[PackedByteArray] = _accum_rb.duplicate()
+			_median_pending = true
+			_task_median = WorkerThreadPool.add_task(_task_compute_median.bind(snap_dbs, snap_rb))
 		return
 	
-	if not WorkerThreadPool.is_task_completed(_task_dbs):
-		return
-	if not WorkerThreadPool.is_task_completed(_task_rb):
-		return
-	
-	# Both tasks done - acknowledge completion (required by docs)
-	WorkerThreadPool.wait_for_task_completion(_task_dbs)
-	WorkerThreadPool.wait_for_task_completion(_task_rb)
-	_task_dbs = -1
-	_task_rb = -1
-	
-	# Get results under lock
+	# Stage 2: Check if median task is done
+	if _median_pending:
+		if not WorkerThreadPool.is_task_completed(_task_median):
+			return
+		
+		WorkerThreadPool.wait_for_task_completion(_task_median)
+		_task_median = -1
+		_median_pending = false
+		
+		# Apply median results on main thread
+		_render_mutex.lock()
+		var final_dbs: PackedByteArray = _median_result_dbs
+		var final_rb: PackedByteArray = _median_result_rb
+		_render_mutex.unlock()
+		
+		_img.set_data(image_size, image_size, false, Image.FORMAT_RGB8, final_dbs)
+		_tex.update(_img)
+		_img_rb.set_data(image_size, image_size, false, Image.FORMAT_RGB8, final_rb)
+		_tex_rb.update(_img_rb)
+		
+		_render_pending = false
+
+func _task_compute_median(bufs_dbs: Array[PackedByteArray], bufs_rb: Array[PackedByteArray]) -> void:
+	"""Worker: compute median or average for both DBS and RB buffers"""
+	var med_dbs: PackedByteArray
+	var med_rb: PackedByteArray
+	if accumulate_mode == 1:
+		med_dbs = _average_pixels(bufs_dbs)
+		med_rb = _average_pixels(bufs_rb)
+	else:
+		med_dbs = _median_pixels(bufs_dbs)
+		med_rb = _median_pixels(bufs_rb)
 	_render_mutex.lock()
-	var px_dbs: PackedByteArray = _pixels_dbs
-	var px_rb: PackedByteArray = _pixels_rb
+	_median_result_dbs = med_dbs
+	_median_result_rb = med_rb
 	_render_mutex.unlock()
+
+func _median_pixels(buffers: Array[PackedByteArray]) -> PackedByteArray:
+	"""Compute per-byte median across multiple pixel buffers"""
+	var count: int = buffers.size()
+	if count == 0:
+		return _bg_pixels.duplicate()
+	if count == 1:
+		return buffers[0]
 	
-	# Apply to textures on main thread (required)
-	_img.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_dbs)
-	_tex.update(_img)
-	_img_rb.set_data(image_size, image_size, false, Image.FORMAT_RGB8, px_rb)
-	_tex_rb.update(_img_rb)
+	var pixel_count: int = buffers[0].size()
+	var result: PackedByteArray = PackedByteArray()
+	result.resize(pixel_count)
 	
-	_render_pending = false
+	# For small counts (typical: 3-7), insertion sort into small array is fastest
+	var vals: Array[int] = []
+	vals.resize(count)
+	
+	for i in range(pixel_count):
+		# Gather values from all buffers for this byte
+		for b in range(count):
+			vals[b] = buffers[b][i]
+		# Sort (small array, ~5 elements)
+		vals.sort()
+		# Median: middle element (or lower-middle for even count)
+		@warning_ignore("integer_division")
+		result[i] = vals[count / 2]
+	
+	return result
+
+func _average_pixels(buffers: Array[PackedByteArray]) -> PackedByteArray:
+	"""Compute per-byte average across multiple pixel buffers"""
+	var count: int = buffers.size()
+	if count == 0:
+		return _bg_pixels.duplicate()
+	if count == 1:
+		return buffers[0]
+	
+	var pixel_count: int = buffers[0].size()
+	var result: PackedByteArray = PackedByteArray()
+	result.resize(pixel_count)
+	
+	for i in range(pixel_count):
+		var total: int = 0
+		for b in range(count):
+			total += buffers[b][i]
+		@warning_ignore("integer_division")
+		result[i] = total / count
+	
+	return result
 
 func _task_compute_pixels(data: PackedVector3Array, is_dbs: bool) -> void:
 	"""Worker task: compute pixels only (no Image/Texture - thread safe)"""
@@ -728,6 +986,144 @@ func _attach_ui() -> void:
 	_ui_rect.stretch_mode = TextureRect.STRETCH_SCALE
 	_ui_rect.texture_filter = CanvasItem.TEXTURE_FILTER_LINEAR
 	_ui_layer.add_child(_ui_rect)
+	
+	# Countdown / progress label — centered over both radar displays
+	_countdown_label = Label.new()
+	_countdown_label.text = ""
+	_countdown_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	# Position centered between the two displays
+	var total_width: float = ui_size_px.x * 2 + 12
+	_countdown_label.position = ui_anchor_top_left + Vector2(0, ui_size_px.y + 24)
+	_countdown_label.size = Vector2(total_width, 24)
+	_countdown_label.add_theme_color_override("font_color", Color(0.3, 1.0, 0.3))
+	_countdown_label.add_theme_color_override("font_shadow_color", Color.BLACK)
+	_countdown_label.add_theme_constant_override("shadow_offset_x", 1)
+	_countdown_label.add_theme_constant_override("shadow_offset_y", 1)
+	_ui_layer.add_child(_countdown_label)
+	
+	# Scale labels — bottom-left of each radar display
+	_scale_label_rb = Label.new()
+	_scale_label_rb.text = ""
+	_scale_label_rb.position = ui_anchor_top_left + Vector2(4, ui_size_px.y + 6)
+	_scale_label_rb.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8, 0.8))
+	_scale_label_rb.add_theme_font_size_override("font_size", 12)
+	_ui_layer.add_child(_scale_label_rb)
+	
+	_scale_label_dbs = Label.new()
+	_scale_label_dbs.text = ""
+	_scale_label_dbs.position = ui_anchor_top_left + Vector2(ui_size_px.x + 16, ui_size_px.y + 6)
+	_scale_label_dbs.add_theme_color_override("font_color", Color(0.8, 0.8, 0.8, 0.8))
+	_scale_label_dbs.add_theme_font_size_override("font_size", 12)
+	_ui_layer.add_child(_scale_label_dbs)
+	
+	# LOD resolution label — below countdown
+	_lod_label = Label.new()
+	_lod_label.text = ""
+	_lod_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_lod_label.position = ui_anchor_top_left + Vector2(0, ui_size_px.y + 44)
+	_lod_label.size = Vector2(total_width, 20)
+	_lod_label.add_theme_color_override("font_color", Color(0.7, 0.85, 1.0, 0.9))
+	_lod_label.add_theme_color_override("font_shadow_color", Color.BLACK)
+	_lod_label.add_theme_constant_override("shadow_offset_x", 1)
+	_lod_label.add_theme_constant_override("shadow_offset_y", 1)
+	_lod_label.add_theme_font_size_override("font_size", 12)
+	_ui_layer.add_child(_lod_label)
+	
+	# Loading overlay — fullscreen dark overlay shown during initial terrain load
+	_loading_overlay = ColorRect.new()
+	_loading_overlay.color = Color(0.05, 0.05, 0.1, 0.85)
+	_loading_overlay.set_anchors_preset(Control.PRESET_FULL_RECT)
+	_loading_overlay.visible = true   # Start visible; hidden once terrain finishes loading
+	_ui_layer.add_child(_loading_overlay)
+	
+	_loading_label = Label.new()
+	_loading_label.text = "Loading terrain..."
+	_loading_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_loading_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	_loading_label.set_anchors_preset(Control.PRESET_CENTER)
+	_loading_label.grow_horizontal = Control.GROW_DIRECTION_BOTH
+	_loading_label.grow_vertical = Control.GROW_DIRECTION_BOTH
+	_loading_label.size = Vector2(400, 60)
+	_loading_label.position = Vector2(-200, -30)
+	_loading_label.add_theme_color_override("font_color", Color(0.9, 0.95, 1.0))
+	_loading_label.add_theme_font_size_override("font_size", 24)
+	_loading_overlay.add_child(_loading_label)
+
+func _update_countdown_label() -> void:
+	if not _countdown_label:
+		return
+	
+	# Waiting for terrain chunks to reach target resolution
+	if _waiting_for_terrain:
+		var pending: int = _chunk_manager.get_pending_chunk_count() if _chunk_manager else 0
+		_countdown_label.text = "Waiting for terrain... %d chunks pending" % pending
+		_countdown_label.add_theme_color_override("font_color", Color(1.0, 0.7, 0.3))
+		return
+	else:
+		_countdown_label.add_theme_color_override("font_color", Color(0.3, 1.0, 0.3))
+	
+	if _scan_in_progress and _total_rays > 0:
+		var progress: float = float(_current_ray_index) / float(_total_rays)
+		var elapsed: float = Time.get_ticks_msec() / 1000.0 - _scan_start_time
+		var eta: float = 0.0
+		if progress > 0.01:
+			eta = elapsed / progress * (1.0 - progress)
+		_countdown_label.text = "Scanning... %d%% | ETA %.1fs" % [int(progress * 100.0), eta]
+	elif _render_pending or _median_pending:
+		_countdown_label.text = "Processing..."
+	else:
+		_countdown_label.text = "Ready"
+
+func _update_lod_label() -> void:
+	if not _lod_label:
+		return
+	if not _chunk_manager:
+		_lod_label.text = "LOD: N/A"
+		return
+	var res: int = _chunk_manager.get_current_focus_resolution()
+	var mps: float = _chunk_manager.get_meters_per_sample()
+	var manual_txt: String = " [MANUAL]" if _chunk_manager._manual_resolution > 0 else ""
+	_lod_label.text = "LOD: %d×%d  (%.1f m/sample)%s" % [res, res, mps, manual_txt]
+
+func _update_scale_labels() -> void:
+	if not _scale_label_rb or not _scale_label_dbs:
+		return
+	
+	# Compute meters per pixel from display range and UI size
+	var range_m: float = display_range_x.y - display_range_x.x
+	if range_m < 0.01 or ui_size_px.x < 1:
+		return
+	
+	var m_per_px: float = range_m / float(ui_size_px.x)
+	
+	# Choose a nice round scale bar length
+	var bar_m: float = _nice_scale_value(range_m * 0.25)  # ~25% of display width
+	var bar_px: int = int(bar_m / m_per_px)
+	
+	# Build text with a simple ASCII bar
+	var bar_str: String = "|"
+	@warning_ignore("integer_division")
+	var dashes: int = maxi(2, bar_px / 6)  # rough char width
+	for _i in range(dashes):
+		bar_str += "-"
+	bar_str += "| "
+	
+	if bar_m >= 1000.0:
+		bar_str += "%.1f km" % (bar_m / 1000.0)
+	else:
+		bar_str += "%.0f m" % bar_m
+	
+	_scale_label_rb.text = bar_str
+	_scale_label_dbs.text = bar_str
+
+func _nice_scale_value(approx: float) -> float:
+	"""Round to a nice human-readable distance value."""
+	var targets: Array[float] = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000]
+	var best: float = targets[0]
+	for t in targets:
+		if absf(t - approx) < absf(best - approx):
+			best = t
+	return best
 
 func _create_debug() -> void:
 	_dbg_mesh = ImmediateMesh.new()

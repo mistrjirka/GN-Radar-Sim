@@ -44,12 +44,26 @@ func _find_node_with_property(node: Node, property_name: String) -> Node:
 	return null
 
 func _find_terrain_manager():
+	# TerrainChunkManager is created at runtime by ProceduralTerrainSetup,
+	# so wait a few frames for it to exist in the tree.
+	await get_tree().process_frame
+	await get_tree().process_frame
+	await get_tree().process_frame
 	var root = get_tree().current_scene
-	terrain_manager = _find_node_with_property(root, "chunk_size")
+	terrain_manager = _find_node_by_class_name(root, "TerrainChunkManager")
 	if terrain_manager:
 		print("Terrain manager found: ", terrain_manager.name)
 	else:
 		print("INFO: No terrain manager found (optional)")
+
+func _find_node_by_class_name(node: Node, cls: String) -> Node:
+	if node.get_script() and node.get_script().get_global_name() == cls:
+		return node
+	for child in node.get_children():
+		var result = _find_node_by_class_name(child, cls)
+		if result:
+			return result
+	return null
 
 func _input(event):
 	if event is InputEventMouseMotion:
@@ -67,6 +81,15 @@ func _input(event):
 			_adjust_radar_beam_width(1.0)
 		elif event.button_index == MOUSE_BUTTON_WHEEL_DOWN and event.pressed:
 			_adjust_radar_beam_width(-1.0)
+	
+	# +/- keys to manually step terrain LOD resolution
+	if event is InputEventKey and event.pressed:
+		if event.keycode == KEY_EQUAL or event.keycode == KEY_KP_ADD:  # + key
+			_step_lod_resolution(1)
+		elif event.keycode == KEY_MINUS or event.keycode == KEY_KP_SUBTRACT:  # - key
+			_step_lod_resolution(-1)
+		elif event.keycode == KEY_0 or event.keycode == KEY_KP_0:  # 0 = auto LOD
+			_reset_lod_auto()
 
 func _aim_radar_at_click(screen_pos: Vector2):
 	if not camera or not radar_node:
@@ -101,6 +124,22 @@ func _adjust_radar_beam_width(delta: float):
 	# Update terrain LOD if available
 	if terrain_manager and terrain_manager.has_method("set_beam_width"):
 		terrain_manager.set_beam_width(new_width)
+
+func _step_lod_resolution(direction: int) -> void:
+	"""Step terrain LOD resolution up (+1) or down (-1) manually."""
+	if not terrain_manager or not terrain_manager.has_method("step_manual_resolution"):
+		print("No terrain manager for LOD control")
+		return
+	var new_res: int = terrain_manager.step_manual_resolution(direction)
+	var mps: float = terrain_manager.get_meters_per_sample()
+	print("LOD: %d×%d  (%.1f m/sample) [MANUAL]" % [new_res, new_res, mps])
+
+func _reset_lod_auto() -> void:
+	"""Reset LOD to automatic (beam-width driven)."""
+	if not terrain_manager or not terrain_manager.has_method("set_manual_resolution"):
+		return
+	terrain_manager.set_manual_resolution(0)
+	print("LOD: auto mode")
 
 var mouse_mode_captured : bool = true
 

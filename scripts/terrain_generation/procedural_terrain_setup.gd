@@ -5,7 +5,7 @@ class_name ProceduralTerrainSetup
 
 ## Configure these in the inspector or via code
 @export var terrain_seed: int = 42
-@export var chunk_size: float = 256.0
+@export var chunk_size: float = 128.0
 @export var load_radius: float = 2000.0
 @export var heightmap_resolution: int = 130
 
