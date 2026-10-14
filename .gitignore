@@ -1,3 +1,8 @@
 # Godot 4+ specific ignores
 .godot/
 /android/
+
+.radar_runtime/
+__pycache__/
+*.pyc
+game/radar/backend/cache/
