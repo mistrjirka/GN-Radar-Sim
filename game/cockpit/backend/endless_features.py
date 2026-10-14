@@ -9,6 +9,7 @@ import numpy as np
 from endless_terrain import fields, river_center, crossing_y
 
 CELL=4096.0
+MAX_CACHED_CELLS=256  # Bounded metadata halo for the 20km receiver.
 
 class FeatureCells:
     def __init__(self,seed):
@@ -48,7 +49,7 @@ class FeatureCells:
                     record['warehouses'].append(dict(x=float(x+110*(k%2)),y=float(y+85*(k//2)),
                         length=float(rng.choice([54,72,84])),width=35.,angle=angle,height=12.,ridge=3.))
         self.cache[key]=record
-        while len(self.cache)>96:self.cache.popitem(last=False)
+        while len(self.cache)>MAX_CACHED_CELLS:self.cache.popitem(last=False)
         return record
 
     def query(self,bounds):

@@ -12,6 +12,8 @@ var stream_step:=2000.0
 var sheet_forward:=4000.0
 var revisions:=0
 var retry_seconds:=0.0
+var pending_image:Image
+var pending_data:Dictionary={}
 
 func configure(state,display,transport,manifest:Dictionary) -> void:
 	mission=state;chart=display;link=transport
@@ -26,6 +28,11 @@ func configure(state,display,transport,manifest:Dictionary) -> void:
 
 func _process(dt:float) -> void:
 	if mission==null or not mission.active or mission.finished:return
+	if chart.acquisition_locked:return
+	if not pending_data.is_empty():
+		var data:Dictionary=pending_data;var image:Image=pending_image
+		pending_data={};pending_image=null
+		_accept(image,data)
 	retry_seconds=maxf(0,retry_seconds-dt)
 	clock+=dt
 	if clock<.4 or retry_seconds>0:return
@@ -41,6 +48,9 @@ func _local_bounds(bounds:Array) -> Rect2:
 
 func _accept(image:Image,data:Dictionary) -> void:
 	if int(data.get("seed",-1))!=mission.seed_value:return
+	if chart.acquisition_locked:
+		pending_image=image;pending_data=data
+		return
 	var started:=Time.get_ticks_usec()
 	global_bounds=data["bounds"];latest=data;last_key=str(data.get("sheet_key",last_key))
 	# Retain previous paper until the full next sheet is ready. No texture blanking.
@@ -70,6 +80,7 @@ func local_public() -> Dictionary:
 func _rebase(offset:Vector2) -> void:
 	chart.world_bounds.position-=offset
 	chart.selected_center-=offset
+	chart.rebase_acquisition(offset)
 	chart.aircraft=mission.position
 	chart.target-=offset;chart.egress-=offset
 	for i in range(chart.trail.size()):chart.trail[i]-=offset
@@ -82,9 +93,9 @@ func _failed(_message:String) -> void:
 
 
 func prefetch_position() -> Array:
-	# Request ahead of the current aircraft, not only after entering the next
-	# 2km sheet cell. The extra north margin covers the north-up paper's high
-	# forward anchor at its widest zoom while decoding/generation runs.
+	# Centre the square cache on the visible map, whichever way the aircraft faces.
+	# Round the 2km grid using its half-step; subtract the provider's north offset.
 	var p:Array=mission.global_position_array()
-	var travel:float=mission.speed*8.0
-	return [float(p[0])+sin(mission.heading)*travel,float(p[1])+cos(mission.heading)*travel+500.0]
+	var lead:float=(chart.anchor().y-chart.size.y*.5)/chart.scale_px+mission.speed*8.0
+	return [float(p[0])+sin(mission.heading)*lead+stream_step*.5,
+		float(p[1])+cos(mission.heading)*lead+stream_step*.5-sheet_forward]

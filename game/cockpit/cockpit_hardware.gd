@@ -51,7 +51,7 @@ static func build_control(
 	root.add_child(plate)
 	var moving := Node3D.new()
 	root.add_child(moving)
-	var is_knob := action in ["gain", "range", "select"]
+	var is_knob := action in ["gain", "range", "select", "resolution"]
 	var is_toggle := action in ["arm_guard", "hold"]
 	if is_knob:
 		rig.cylinder(moving, Vector3(0, 0, 0.025), 0.036, 0.035, rig.steel)
@@ -71,8 +71,8 @@ static func build_control(
 			Vector3(0.004, 0.014, 0.002),
 			rig.material(Color(0.58, 0.52, 0.37))
 		)
-		for i in range(7):
-			var angle := deg_to_rad(-120 + i * 40)
+		for i in range(3 if action=="resolution" else 7):
+			var angle := deg_to_rad(-60+i*60 if action=="resolution" else -120+i*40)
 			var tick = rig.box(
 				root,
 				Vector3(sin(angle) * 0.044, cos(angle) * 0.044, 0.013),
@@ -105,6 +105,10 @@ static func build_control(
 		)
 		moving.add_child(key)
 	# Engraved name plates; text never overlays the radar pixels.
+	if action=="resolution":
+		for i in range(3):
+			var angle:=deg_to_rad(-60+i*60)
+			rig.label(root,["FAST","MED","FINE"][i],Vector3(sin(angle)*.090,cos(angle)*.055+.012,.028),.00022,Color(.60,.53,.37))
 	var label_y := (0.073 if pos.y < 0.32 else -0.058) if is_knob or is_toggle else 0.0
 	rig.label(
 		root,
@@ -147,6 +151,7 @@ static func add_station_details(rig: Node3D) -> void:
 				Vector3(0.003, 0.066, 0.003),
 				rig.dark
 			)
+	if rig.revised_station:return
 	var legend = rig.label(
 		rig,
 		"RAVEN  /  WSO STATION\nFRAME HELD UNTIL NEXT ACQUISITION",

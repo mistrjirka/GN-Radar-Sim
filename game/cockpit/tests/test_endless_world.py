@@ -11,7 +11,7 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
 import mission_worker as worker
 from endless_world import EndlessWorld
 from endless_terrain import fields
-from endless_features import FeatureCells
+from endless_features import FeatureCells,MAX_CACHED_CELLS
 from chart_stream import ChartStream
 
 class EndlessWorldTests(unittest.TestCase):
@@ -72,8 +72,9 @@ class EndlessWorldTests(unittest.TestCase):
 
     def test_feature_ids_survive_cache_eviction(self):
         cells=FeatureCells(42);a=copy.deepcopy(cells.cell(-7,25))
-        for ix in range(115):cells.cell(ix,0)
-        self.assertLessEqual(len(cells.cache),96)
+        for ix in range(MAX_CACHED_CELLS+20):cells.cell(ix,0)
+        self.assertNotIn((-7,25),cells.cache)
+        self.assertLessEqual(len(cells.cache),MAX_CACHED_CELLS)
         self.assertEqual(a,cells.cell(-7,25))
         for r in cells.query([-30000,30000,-30000,30000])['sites']:
             self.assertTrue(0<=r['id']<2**52)

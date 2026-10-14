@@ -16,8 +16,9 @@ from endless_terrain import fields, noise
 from endless_features import FeatureCells
 from region_features import add_features
 from approved_renderer import g
+from scan_geometry import LIMITS
 
-CHART_WIDTH=16000.0
+CHART_WIDTH=20000.0
 CHART_HEIGHT=20000.0
 CHART_STEP=10.0
 STREAM_STEP=2000.0
@@ -43,7 +44,7 @@ class EndlessWorld(SortieRegion):
             chart_note='OPEN FLIGHT / PILOT HOLDS YOUR COMMANDED HEADING',
             world_version='endless-v1',suggested_routes={},checkpoints=[])
 
-    def emitters(self):return self._emitters(self._initial_sheet['bounds'])
+    def emitters(self):return self._emitters(self.receiver_bounds(self.start))
 
     def _emitters(self,bounds):
         return [{k:copy.deepcopy(v) for k,v in r.items() if k!='layout_angle'} for r in self.features.query(bounds)['sites']]
@@ -63,7 +64,13 @@ class EndlessWorld(SortieRegion):
         data=self.features.query(sheet['bounds'])
         return dict(**sheet,seed=self.seed,scenario='endless',suspected=copy.deepcopy(data['suspected']),
             landmarks=[{'position':[b['x'],b['y']],'label':'BRIDGE'} for b in data['bridges']],
-            emitters=self._emitters(sheet['bounds']))
+            emitters=self._emitters(self.receiver_bounds(center)))
+
+    @staticmethod
+    def receiver_bounds(center):
+        x,y=map(float,center)
+        r=LIMITS['receiver_load_radius_m']
+        return [x-r,x+r,y-r,y+r]
 
     def clamp_center(self,center,extent):
         c=np.asarray(center,dtype=np.float64)
@@ -71,9 +78,10 @@ class EndlessWorld(SortieRegion):
         if not 400<=float(extent)<=4000:raise ValueError('Scan width must be 400..4000m')
         return c.copy()  # No clamp, finite mission boundary, or wraparound.
 
-    def patch(self,center,extent):
+    def patch(self,center,extent,heading=0.0):
         start=time.perf_counter();c=self.clamp_center(center,extent)
-        key=(float(c[0]),float(c[1]),float(extent))
+        if not math.isfinite(heading):raise ValueError("Invalid patch orientation")
+        key=(float(c[0]),float(c[1]),float(extent),float(heading))
         if key in self._patches:
             self._patches.move_to_end(key);return self._patches[key],c
         w=g.RadarTestWorldV6_5.__new__(g.RadarTestWorldV6_5)
@@ -82,8 +90,11 @@ class EndlessWorld(SortieRegion):
         q=np.linspace(-extent/2,extent/2,w.N,dtype=np.float32)
         w.X,w.Y=np.meshgrid(q,q)
         w._world_center=c.tolist();w._region=self
-        w._global_x=w.X.astype(np.float64)+c[0];w._global_y=w.Y.astype(np.float64)+c[1]
-        data=self.features.query([c[0]-extent/2,c[0]+extent/2,c[1]-extent/2,c[1]+extent/2])
+        ch,sh=math.cos(heading),math.sin(heading)
+        w._global_x=w.X.astype(np.float64)*ch+w.Y.astype(np.float64)*sh+c[0]
+        w._global_y=-w.X.astype(np.float64)*sh+w.Y.astype(np.float64)*ch+c[1]
+        half=extent*.5*(abs(ch)+abs(sh))
+        data=self.features.query([c[0]-half,c[0]+half,c[1]-half,c[1]+half])
         f=self.ground(w._global_x,w._global_y)
         w._ground_height=f['ground'];w._water_mask=f['water'];w.mat_id=f['mat']
         w.height=(f['ground']+f['canopy']).astype(np.float32)
@@ -100,6 +111,14 @@ class EndlessWorld(SortieRegion):
             w._feature_bases=dict(zip(points,map(float,heights)))
         smooth=gaussian_filter(w.height,1.2)
         add_features(w,SimpleNamespace(**data))
+        if heading!=0.0:
+            # Features are authored globally. Convert directional material fields
+            # into the same local axes as radar pixels and the aircraft position.
+            w.furrow_az=(w.furrow_az+heading).astype(np.float32)
+            w.dihedral_az=(w.dihedral_az+heading).astype(np.float32)
+            nx,ny=w.wall_nx,w.wall_ny
+            w.wall_nx=(ch*nx-sh*ny).astype(np.float32)
+            w.wall_ny=(sh*nx+ch*ny).astype(np.float32)
         w.smooth_h_for_normals=smooth;w._compute_normals()
         w.rng=np.random.default_rng(self.seed+42);w._initial_rng=copy.deepcopy(w.rng.bit_generator.state)
         w._generation_s=time.perf_counter()-start

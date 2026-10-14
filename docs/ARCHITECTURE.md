@@ -1,5 +1,8 @@
 # Cockpit code boundaries
 
+> Current exploration changes (heading-up bottom-center paper, locked acquisitions, whole-image resolving, approximate-range RWR and user-marked coordinate rounds) are described in `PLAYABILITY.md`. Older measurements and original finite-mode contracts below are historical; the latest user corrections supersede them.
+
+
 The design requirements are in [USER_REQUESTS.md](USER_REQUESTS.md). Runtime controls and measured build status belong in [the cockpit README](../game/cockpit/README.md). This document describes the code, not additional user requirements.
 
 ## Runtime flow

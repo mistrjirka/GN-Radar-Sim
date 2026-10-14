@@ -8,6 +8,7 @@ var _updates:Array=[]
 var _stopping:=false
 var _folder:=""
 var _stream_last_key:=""
+var progressive_display:=false  # Set before starting the owned transport thread.
 
 func start(folder:String) -> Error:
 	_folder=folder
@@ -55,7 +56,13 @@ func _read_frame(status:Dictionary) -> Dictionary:
 	if file==null:return {"error":"Radar frame missing"}
 	var bytes:=file.get_buffer(file.get_length());file.close()
 	if bytes.size()!=width*height:return {"error":"Incomplete radar frame"}
-	return {"image":Image.create_from_data(width,height,false,Image.FORMAT_L8,bytes)}
+	var image:=Image.create_from_data(width,height,false,Image.FORMAT_L8,bytes)
+	# Filtered levels are built off-thread once. Original level-zero bytes stay
+	# intact; the GPU only chooses a level during whole-image resolving.
+	if progressive_display:
+		var error:=image.generate_mipmaps()
+		if error!=OK:return {"error":"Cannot prepare radar display levels"}
+	return {"image":image}
 
 func _run() -> void:
 	var last_key:=""

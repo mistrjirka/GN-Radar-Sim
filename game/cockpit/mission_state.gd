@@ -6,6 +6,13 @@ const Route = preload("res://game/cockpit/navigation_route.gd")
 signal radio(text: String, cue: String)
 signal event(kind: String)
 signal origin_shifted(offset:Vector2)
+const ScanGeometry = preload("res://game/cockpit/scan_geometry.gd")
+const CoordinateWeapon = preload("res://game/cockpit/coordinate_weapon.gd")
+var coordinate_weapon = CoordinateWeapon.new()
+var designated_point: Array = []
+var designation_scan := -1
+var coordinate_impacts: Array = []
+var last_coordinate_outcome := ""
 var heading_control=preload("res://game/cockpit/heading_control.gd").new()
 var origin_east:float=0.0
 var origin_north:float=0.0
@@ -63,6 +70,8 @@ func setup(data: Dictionary) -> void:
 	region_scenario=str(data.get("scenario","reference"))
 	endless=region_scenario=="endless"
 	origin_east=0.0;origin_north=0.0;origin_shift_count=0;silenced.clear();heading_control.reset()
+	coordinate_weapon=CoordinateWeapon.new();designated_point.clear();designation_scan=-1
+	coordinate_impacts.clear();last_coordinate_outcome=""
 	var b:Array=data.get("bounds",[-tuning.flight_boundary,tuning.flight_boundary,-tuning.flight_boundary,tuning.flight_boundary])
 	# The old test map starts outside its image; retain its original flight area.
 	flight_bounds=Rect2(Vector2(b[0],b[2]),Vector2(b[1]-b[0],b[3]-b[2])) if region_scenario=="sortie" else Rect2(-tuning.flight_boundary,-tuning.flight_boundary,2*tuning.flight_boundary,2*tuning.flight_boundary)
@@ -213,6 +222,7 @@ func _step(dt: float) -> void:
 	evade_time = maxf(0.0, evade_time - dt)
 	scan_transmit_time = maxf(0.0, scan_transmit_time - dt)
 	_update_pending_arm(dt)
+	if endless:_update_coordinate_weapon(dt)
 	_update_threats(dt)
 	if endless:
 		_rebase_if_needed()
@@ -294,6 +304,7 @@ func _update_threats(dt: float) -> void:
 
 
 func receiver_contacts() -> Array:
+	if endless:return _estimated_contacts()
 	# Keep this narrow interface: RWR has no world positions or distance fields.
 	var contacts: Array = []
 	for emitter in emitters:
@@ -444,7 +455,11 @@ func update_endless_nearby(data:Dictionary) -> void:
 	for source in data.get("emitters",[]):
 		var e:Dictionary=source.duplicate(true)
 		var p:=local_point(e["position"]);e["position"]=[p.x,p.y]
-		e["disabled"]=silenced.has(int(e["id"]))
+		e["disabled"]=bool(e.get("disabled",false)) or silenced.has(int(e["id"]))
+		for impact in coordinate_impacts:
+			var distance:=Vector2(float(source["position"][0])-float(impact[0]),float(source["position"][1])-float(impact[1])).length()
+			if distance<=coordinate_weapon.impact_radius:
+				e["disabled"]=true;silenced[int(e["id"])]=true
 		emitters.append(e)
 	suspected=[]
 	for source in data.get("suspected",[]):
@@ -463,3 +478,60 @@ func _rebase_if_needed() -> void:
 		c["center"]=[float(c["center"][0])-shift.x,float(c["center"][1])-shift.y]
 	origin_shift_count+=1
 	origin_shifted.emit(shift)
+
+
+func _estimated_contacts() -> Array:
+	var result: Array=[]
+	var maximum: float=ScanGeometry.limits["receiver_range_m"]
+	for emitter in emitters:
+		if emitter.get("disabled",false):continue
+		var delta:=Vector2(emitter["position"][0],emitter["position"][1])-position
+		var distance:=delta.length()
+		if distance>maximum:continue
+		var id:=int(emitter["id"])
+		# A fictional received-strength estimate using an assumed source strength.
+		# Variation in actual source power therefore produces range uncertainty.
+		var strength:=float(emitter["power"])/(1.0+pow(distance/6000.0,2))
+		var estimate:=6000.0*sqrt(maxf(0,.85/maxf(strength,.001)-1.0))
+		estimate*=1.0+.045*sin(elapsed*.12+float(id%61))
+		estimate=clampf(round(estimate/500.0)*500.0,500.0,maximum)
+		result.append({"id":id,"bearing":wrapf(atan2(delta.x,delta.y)-heading+deg_to_rad(1.0)*sin(elapsed*.2+float(id%97)),-PI,PI),
+			"strength":clampf(strength,.04,1.0),"tracking":distance<1800.0 and tracking>.28,
+			"estimated_range_m":estimate,"range_uncertainty_m":maxf(500.0,estimate*.25)})
+	result.sort_custom(func(a,b):return float(a["strength"])>float(b["strength"]))
+	return result
+
+func designate_radar_point(point: Array, scan_id: int) -> bool:
+	if not endless or not active or finished or point.size()!=2 or scan_id<0:return false
+	for value in point:
+		if not is_finite(float(value)):return false
+	designated_point=point.duplicate();designation_scan=scan_id
+	last_coordinate_outcome="POINT MARKED"
+	return true
+
+func clear_designation() -> void:
+	designated_point.clear();designation_scan=-1
+	last_coordinate_outcome=""
+
+func fire_coordinate() -> bool:
+	if not endless or not active or finished or not armed:return false
+	if arm_count<=0 or coordinate_weapon.active or designated_point.is_empty():return false
+	if not coordinate_weapon.launch(global_position_array(),designated_point,designation_scan):return false
+	arm_count-=1
+	last_coordinate_outcome="IN FLIGHT"
+	_announce("WEAPONS / Coordinate round away. Flying to the marked point.","arm_away")
+	event.emit("coordinate_away")
+	return true
+
+func _update_coordinate_weapon(dt: float) -> void:
+	if not coordinate_weapon.advance(dt):return
+	var impact: Array=coordinate_weapon.destination.duplicate()
+	coordinate_impacts.append(impact)
+	if coordinate_impacts.size()>64:coordinate_impacts.pop_front()
+	for emitter in emitters:
+		var p: Array=global_point(Vector2(emitter["position"][0],emitter["position"][1]))
+		if Vector2(float(p[0])-float(impact[0]),float(p[1])-float(impact[1])).length()<=coordinate_weapon.impact_radius:
+			emitter["disabled"]=true;silenced[int(emitter["id"])]=true
+	last_coordinate_outcome="IMPACT / UNCONFIRMED"
+	_announce("WEAPONS / Round reached the marked coordinate. Effect unconfirmed.","impact")
+	event.emit("coordinate_impact")

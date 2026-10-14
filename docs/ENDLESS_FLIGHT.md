@@ -1,5 +1,8 @@
 # Endless flight, mechanical scan guides and heading control
 
+> Current exploration changes (heading-up bottom-center paper, locked acquisitions, whole-image resolving, approximate-range RWR and user-marked coordinate rounds) are described in `PLAYABILITY.md`. Older measurements and original finite-mode contracts below are historical; the latest user corrections supersede them.
+
+
 Implemented on `homer`, branch `jirka-cockpit-game`. The latest user request supersedes the finite-sortie default: this iteration prioritizes the endless exploration mechanism, scan controls and gradual flight. The old finite scenarios remain available for regression testing.
 
 ## Start and controls

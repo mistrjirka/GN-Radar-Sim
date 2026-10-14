@@ -1,5 +1,8 @@
 # RAVEN TWO — playable bomber sortie
 
+> Current exploration changes (heading-up bottom-center paper, locked acquisitions, whole-image resolving, approximate-range RWR and user-marked coordinate rounds) are described in `../../docs/PLAYABILITY.md`. Older measurements and original finite-mode contracts below are historical; the latest user corrections supersede them.
+
+
 > **Current default: endless exploration.** The latest request supersedes the finite sortie below. Run `./play-cockpit.sh` for continuous generated terrain, four physical scan guides, visible resolution controls and gradual heading commands. See [ENDLESS_FLIGHT.md](../../docs/ENDLESS_FLIGHT.md) for current controls, limits and validation. `--sortie` and `--reference` retain the older scenarios.
 
 

@@ -126,3 +126,21 @@ The player chooses the direction the aircraft should fly. The commanded heading 
 - Make scan-area width adjustable independently of resolution. Four mechanical guides span the paper edge-to-edge: two vertical, two horizontal, forming the acquisition square where they intersect. These are physical guide members, not a floating digital rectangle.
 - The player chooses the direction for the pilot to fly. The aircraft must turn gradually; commanded heading and actual heading must not snap together.
 - Prior requirements still apply: inspect actual screenshots, keep code maintainable, preserve accepted radar imagery, and measure any streaming/scan hitches.
+
+## Playability revision — 2026-10-14, after the first pushed checkpoint
+
+This explicitly supersedes the old bearing-only/no-marking constraints for the current exploration interface. The original finite reference remains accessible.
+
+- Stop the scan guides drifting to another ground area during acquisition. Keep flight running while the acquisition's chart view and ground bounds are locked.
+- Let the image visibly form like an analogue instrument; distinguish display writing from actual worker progress.
+- Permit scans only ahead of the aircraft, not underneath, behind, or far to its side. Validate the whole selected square.
+- Replace the strange old RWR with the supplied circular green reference: cross axes, center ring, middle ring and bearing ticks. Include approximate distance and show sites much farther away. This is a game approximation, not a claim about the reference instrument's true ranging capabilities.
+- Improve the resolution knob and declutter the station.
+- Prototype coordinate/waypoint-guided missiles: the player marks a point on the radar image and fires at that coordinate, rather than selecting a hidden emitter for automatic ARM suppression. Do not snap clicks to a target.
+- Commit and push the project. Preserve an earlier checkpoint and test the changed gameplay, not only FPS.
+
+### Heading-up correction (latest)
+The aircraft symbol is fixed **bottom-center**, pointing up. The paper translates and rotates beneath it with actual flight and heading. It is not fixed at the top. During a scan the acquisition view, orientation, bounds and controls are latched; flight itself continues. Map HOLD is indicated on the bezel. User-authored radar designations and approximate-range RWR replace the earlier prohibitions only in the new exploration interface.
+
+### Analogue image correction — full field, then crisp detail
+The user clarified that the entire radar image should be shown, with details gradually becoming crisp. Do not use a left-to-right wipe, a travelling reveal edge, blank half-screen, or a rotating beam as the reveal mechanism. Start with a soft complete field and converge to the original resolved radar image. Any display-only transition must be distinguished from actual progressive radar computation.

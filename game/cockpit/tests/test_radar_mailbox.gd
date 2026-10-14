@@ -43,6 +43,12 @@ func run() -> void:
 	await create_timer(.08).timeout
 	check(mailbox.take_updates().is_empty(),"Unchanged worker status is not delivered repeatedly")
 	mailbox.shutdown()
+	var progressive=Mailbox.new();progressive.progressive_display=true
+	var packet:Dictionary=progressive._read_frame(status)
+	check(packet.has("image"),"Real transport prepares the progressive image")
+	if packet.has("image"):
+		check(packet["image"].has_mipmaps(),"Transport supplies filtered full-image levels")
+		check(packet["image"].get_data().slice(0,raw.size())==raw,"Progressive display preserves every original grayscale byte")
 	check(mailbox._thread==null,"Transport thread is joined on shutdown")
 	for name_ in ["radar.r8","status.json","request.json","stop"]:DirAccess.remove_absolute(directory.path_join(name_))
 	DirAccess.remove_absolute(directory)

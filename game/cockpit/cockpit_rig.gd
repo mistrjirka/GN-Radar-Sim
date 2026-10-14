@@ -3,6 +3,8 @@ extends Node3D
 const Hardware = preload("res://game/cockpit/cockpit_hardware.gd")
 const Chart = preload("res://game/cockpit/paper_chart.gd")
 const Receiver = preload("res://game/cockpit/receiver_scope.gd")
+var revised_station:=false
+var resolution_mode:=""
 var chart
 var chart_mechanism
 var receiver
@@ -174,6 +176,7 @@ func press_control(action: String) -> void:
 	for c in controls:
 		if c["action"] == action:
 			var moving: Node3D = c["moving"]
+			if action=="resolution":return
 			if c["is_knob"]:
 				c["angle"] += 0.35
 				var turn := create_tween()
@@ -318,12 +321,12 @@ func build() -> void:
 	panel(Vector3(-1.22, .91, .01), Vector2(1.06, 1.24), "RADAR WARNING RECEIVER")
 	panel(Vector3(0, .91, .05), Vector2(1.29, 1.25), "GROUND MAPPING")
 	panel(Vector3(1.24, 1.0, .015), Vector2(1.10, 1.43), "NAVIGATION / ROLL CHART")
-	receiver = Receiver.new()
-	rwr_view = make_view(Vector2i(512, 620), receiver)
+	receiver = preload("res://game/cockpit/range_receiver.gd").new() if revised_station else Receiver.new()
+	rwr_view = make_view(Vector2i(512,512) if revised_station else Vector2i(512,620),receiver)
 	rwr_quad = quad(
 		self,
 		Vector3(-1.22, 1.02, .124),
-		Vector2(.91, .98),
+		Vector2(.94,.94) if revised_station else Vector2(.91,.98),
 		display_material(rwr_view.get_texture(), .86)
 	)
 	chart = Chart.new()
@@ -337,7 +340,7 @@ func build() -> void:
 	# Perimeter lip on CRT, a rounded phosphor shader; no digital overlay at all.
 	box(self, Vector3(0, 1.02, .15), Vector3(1.16, 1.04, .08), dark)
 	radar_material = ShaderMaterial.new()
-	radar_material.shader = load("res://game/cockpit/shaders/phosphor.gdshader")
+	radar_material.shader = load("res://game/cockpit/shaders/analogue_radar.gdshader" if revised_station else "res://game/cockpit/shaders/phosphor.gdshader")
 	var empty := Image.create(8, 8, false, Image.FORMAT_L8)
 	empty.fill(Color.BLACK)
 	radar_material.set_shader_parameter("radar_image", ImageTexture.create_from_image(empty))
@@ -360,15 +363,17 @@ func build() -> void:
 	lamp("TX", Vector3(-.50, .51, .22), "tx", Color(.92, .38, .02))
 	lamp("FRAME", Vector3(.50, .51, .22), "frame", Color(.3, .75, .2))
 	lamp("STORED", Vector3(.28, .51, .22), "stored", Color(.90, .38, .055))
-	control("SELECT", Vector3(-1.44, .295, .14), "select", false, .25)
+	control("CONTACT" if revised_station else "SELECT", Vector3(-1.44, .295, .14), "select", false, .25)
 	control("ARM", Vector3(-1.12, .295, .14), "arm_guard", true, .20)
 	control("FIRE", Vector3(-.86, .295, .14), "arm_fire", true, .19)
+	if revised_station:
+		label(self,"RWR / 20 km EST",Vector3(-1.22,.485,.15),.00044,Color(.42,.54,.34))
 	lamp("SEARCH", Vector3(-1.55, .43, .16), "search", Color(.55, .62, .2))
 	lamp("TRACK", Vector3(-1.23, .43, .16), "track", Color(.95, .32, .035))
 	lamp("LAUNCH", Vector3(-.91, .43, .16), "launch", Color(1, .055, .012))
 	control("COURSE <", Vector3(.97, .295, .15), "left", false, .27)
 	control("> COURSE", Vector3(1.31, .295, .15), "right", false, .27)
-	control("ACK", Vector3(1.60, .295, .15), "ack", false, .19)
+	control("CLEAR" if revised_station else "ACK",Vector3(1.60,.295,.15),"clear_point" if revised_station else "ack",false,.19)
 	box(self,Vector3(0,1.645,.25),Vector3(1.25,.12,.028),dark)
 	control("RES",Vector3(-.52,1.638,.283),"resolution",false,.13)
 	counters["resolution"]=label(self,"FINE 2x2.5m",Vector3(-.17,1.655,.275),.00048,Color(.60,.46,.25))
@@ -390,6 +395,8 @@ func build() -> void:
 	dial(Vector3(1.89, 1.13, .09), .075, "HDG", "heading")
 	dial(Vector3(1.89, .84, .09), .075, "AIRFRAME", "integrity")
 	Hardware.add_station_details(self)
+	if revised_station:
+		counters["scan_status"]=label(self,"READY",Vector3(0,.47,.263),.00038,Color(.62,.45,.25))
 	box(
 		self,
 		Vector3(1.24, 1.84, .06),
@@ -518,3 +525,13 @@ func action_at(screen: Vector2) -> String:
 		if uv_hit(c["mesh"], c["size"], screen).x >= 0:
 			return str(c["action"])
 	return ""
+
+
+func set_resolution_detent(mode:String) -> void:
+	if resolution_mode==mode:return
+	resolution_mode=mode
+	for c in controls:
+		if c["action"]=="resolution":
+			c["angle"]={"survey":deg_to_rad(60),"map":0.0,"detail":deg_to_rad(-60)}[mode]
+			var tween:=create_tween()
+			tween.tween_property(c["moving"],"rotation:z",c["angle"],.16)

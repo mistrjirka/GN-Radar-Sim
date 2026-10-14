@@ -1,11 +1,17 @@
 extends Control
-## North-up physical paper: paper moves with aircraft; ink annotations move with it.
+## Heading-up exploration chart: aircraft stays bottom-center, paper moves beneath it.
+## Finite reference mode retains north-up projection.
 ## Enemy coordinates are never passed into this view, only uncertain intel circles.
 var chart: Texture2D
 var endless:=false
 var commanded_heading:=0.0
 var selector_screen:=Vector2(320,360)
 var sheet_revision:=0
+var ground_locked := false
+var acquisition_locked := false
+var acquisition_origin := Vector2.ZERO
+var acquisition_heading := 0.0
+var show_scan_sector := false
 var world_bounds := Rect2(-1000,-1000,2000,2000)
 var scale_index := 0
 var aircraft := Vector2(0, -1870)
@@ -28,21 +34,40 @@ func anchor() -> Vector2:
 	return Vector2(size.x * .50, size.y * .81)
 
 
-func world_to_screen(p: Vector2) -> Vector2:
-	return anchor() + Vector2((p.x - aircraft.x) * scale_px, -(p.y - aircraft.y) * scale_px)
+func projection_origin() -> Vector2:
+	return acquisition_origin if acquisition_locked else aircraft
 
+func projection_heading() -> float:
+	if not endless:return 0.0
+	return acquisition_heading if acquisition_locked else heading
+
+func world_to_screen(p: Vector2) -> Vector2:
+	var d := p-projection_origin()
+	var h := projection_heading()
+	return anchor()+Vector2(d.x*cos(h)-d.y*sin(h),-d.x*sin(h)-d.y*cos(h))*scale_px
 
 func screen_to_world(p: Vector2) -> Vector2:
-	var d: Vector2 = (p - anchor()) / scale_px
-	return aircraft + Vector2(d.x, -d.y)
+	var d:Vector2=(p-anchor())/scale_px
+	var h:=projection_heading()
+	return projection_origin()+Vector2(d.x*cos(h)-d.y*sin(h),-d.x*sin(h)-d.y*cos(h))
+
+func selection_heading() -> float:
+	return projection_heading()
+
+func selection_corners() -> PackedVector2Array:
+	var rect:=selection_rect()
+	return PackedVector2Array([screen_to_world(rect.position),screen_to_world(Vector2(rect.end.x,rect.position.y)),
+		screen_to_world(rect.end),screen_to_world(Vector2(rect.position.x,rect.end.y))])
 
 
 func select(point: Vector2) -> void:
+	if acquisition_locked:return
 	if endless:
 		_fit_selector()
 		var half:=selected_extent*scale_px/2
 		selector_screen=world_to_screen(point).clamp(Vector2.ONE*(half+14),size-Vector2.ONE*(half+14))
 		selected_center=screen_to_world(selector_screen)
+		ground_locked=false
 		queue_redraw();return
 	var h := selected_extent / 2
 	selected_center = Vector2(
@@ -52,24 +77,22 @@ func select(point: Vector2) -> void:
 
 
 func change_extent(value: float) -> void:
-	selected_extent = value
-	select(selected_center)
+	if acquisition_locked:return
+	selected_extent=value
+	if endless:
+		_fit_selector()
+		follow_paper()
+		queue_redraw()
+	else:select(selected_center)
 
 
 func _draw() -> void:
 	draw_rect(Rect2(Vector2.ZERO, size), paper_color)
-	# A continuous paper grid also covers the blank chart leader before terrain.
-	var start := screen_to_world(Vector2(0, size.y))
-	var finish := screen_to_world(Vector2(size.x, 0))
-	for x in range(int(floor(start.x / 250)) * 250, int(finish.x) + 251, 250):
-		var pos := world_to_screen(Vector2(x, 0)).x
-		draw_line(Vector2(pos, 0), Vector2(pos, size.y), Color(.31, .29, .23, .25), .7)
-	for y in range(int(floor(start.y / 250)) * 250, int(finish.y) + 251, 250):
-		var pos := world_to_screen(Vector2(0, y)).y
-		draw_line(Vector2(0, pos), Vector2(size.x, pos), Color(.31, .29, .23, .25), .7)
 	if chart:
-		var nw := world_to_screen(Vector2(world_bounds.position.x,world_bounds.end.y))
-		draw_texture_rect(chart, Rect2(nw, world_bounds.size * scale_px), false)
+		var b:=world_bounds
+		var corners:=PackedVector2Array([world_to_screen(Vector2(b.position.x,b.end.y)),world_to_screen(b.end),
+			world_to_screen(Vector2(b.end.x,b.position.y)),world_to_screen(b.position)])
+		draw_polygon(corners,PackedColorArray([Color.WHITE]),PackedVector2Array([Vector2(0,0),Vector2(1,0),Vector2(1,1),Vector2(0,1)]),chart)
 	# Irregular pencilled circles: their centers are deliberately imprecise.
 	for i in range(suspected.size()):
 		var circle = suspected[i]
@@ -115,12 +138,14 @@ func _draw() -> void:
 	# Selection is now four native mechanical bars built by chart_mechanism.gd.
 	# No tinted rectangle or glowing corner dots are painted onto the paper.
 	if endless:
-		var aim:=Vector2(sin(commanded_heading),-cos(commanded_heading))
+		var relative:=commanded_heading-projection_heading()
+		var aim:=Vector2(sin(relative),-cos(relative))
 		var segment:=clip_chart_segment(anchor(),anchor()+aim*2000,Rect2(Vector2(12,12),size-Vector2(24,24)))
 		if segment.size()==2:draw_dashed_line(segment[0],segment[1],Color(.16,.22,.24,.75),1.4,8,true)
-	var a := anchor()
-	var tip := Vector2(sin(heading), -cos(heading))
-	var right := Vector2(cos(heading), sin(heading))
+	var a := anchor() if endless else world_to_screen(aircraft)
+	var icon_angle:=0.0 if endless else heading
+	var tip := Vector2(sin(icon_angle),-cos(icon_angle))
+	var right := Vector2(cos(icon_angle),sin(icon_angle))
 	draw_line(a - tip * 12, a + tip * 13, Color(.14, .16, .15), 2.0, true)
 	draw_line(a - right * 10, a + right * 10, Color(.14, .16, .15), 2.0, true)
 	draw_line(a - tip * 9 - right * 5, a - tip * 9 + right * 5, Color(.14, .16, .15), 1.8, true)
@@ -171,6 +196,7 @@ func configure_region(bounds: Array) -> void:
 	select(selected_center)
 
 func cycle_scale() -> void:
+	if acquisition_locked:return
 	var choices:Array=[.065,.08,.11,.20,.29] if endless else [.04,.08,.11,.20,.29]
 	if endless:
 		var limit:float=(minf(size.x,size.y)-60)/maxf(selected_extent,1)
@@ -199,9 +225,28 @@ func _fit_selector() -> void:
 	selector_screen=selector_screen.clamp(Vector2.ONE*(half+14),size-Vector2.ONE*(half+14))
 
 func follow_paper() -> void:
+	if acquisition_locked:return
 	if endless:
-		_fit_selector()
-		selected_center=screen_to_world(selector_screen)
+		if ground_locked:
+			selector_screen=world_to_screen(selected_center)
+		else:
+			_fit_selector()
+			selected_center=screen_to_world(selector_screen)
+
+func lock_acquisition() -> void:
+	acquisition_origin=aircraft
+	acquisition_heading=heading
+	acquisition_locked=true
+	ground_locked=true
+
+func unlock_acquisition() -> void:
+	acquisition_locked=false
+	ground_locked=false
+	follow_paper()
+	queue_redraw()
+
+func rebase_acquisition(offset: Vector2) -> void:
+	acquisition_origin-=offset
 
 func install_sheet(texture:Texture2D,bounds:Rect2) -> void:
 	chart=texture;world_bounds=bounds;sheet_revision+=1;queue_redraw()

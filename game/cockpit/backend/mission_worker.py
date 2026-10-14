@@ -24,6 +24,7 @@ from sortie_region import SortieRegion
 from endless_world import EndlessWorld
 from chart_stream import ChartStream
 from scan_acceleration import ParallelRadar
+from scan_geometry import validate_forward_scan
 from approved_renderer import Instrument,measure,image_measurements,plt
 
 
@@ -116,15 +117,19 @@ def selected_world(world,center,extent):
     return out,c
 
 
-def render_patch(world,pose,center,extent,quality,folder,rid,accelerator=None):
+def render_patch(world,pose,center,extent,quality,folder,rid,accelerator=None,heading=None):
+    if heading is not None:validate_forward_scan(pose,heading,center,extent)
     patch_started=time.perf_counter()
-    patch,c=selected_world(world,center,extent)
+    patch,c=world.patch(center,extent,heading) if heading is not None and isinstance(world,EndlessWorld) else selected_world(world,center,extent)
     patch_seconds=time.perf_counter()-patch_started
     pose=[float(v) for v in pose]
     if len(pose)!=3 or not np.isfinite(pose).all():raise ValueError('Invalid aircraft pose')
     if not 100<=pose[2]<=5000:raise ValueError('Invalid game altitude')
     if not isinstance(world,EndlessWorld) and any(abs(v)>10000 for v in pose[:2]):raise ValueError('Aircraft outside prototype region')
     local=[pose[0]-float(c[0]),pose[1]-float(c[1]),pose[2]]
+    if heading is not None and isinstance(world,EndlessWorld):
+        co,si=np.cos(heading),np.sin(heading)
+        x,y=local[:2];local=[float(x*co-y*si),float(x*si+y*co),pose[2]]
     # Reference-range PSF becomes singular exactly overhead. The cockpit refuses
     # such a request instead of silently fabricating a displaced aircraft.
     if np.hypot(*local[:2])<100:raise ValueError('SCAN INHIBITED · select an area ahead of the aircraft')
@@ -144,7 +149,7 @@ def render_patch(world,pose,center,extent,quality,folder,rid,accelerator=None):
     png=folder/f'radar_{rid}.png';Image.fromarray(raw).save(png)
     return {'raw_image':str(file),'image':str(png),'width':raw.shape[1],'height':raw.shape[0],
       'center':c.tolist(),'extent':extent,'pose':pose,'stats':stats,'quality':quality,
-      'terrain_seconds':patch_seconds,'encoding_and_write_seconds':time.perf_counter()-encode_started}
+      'heading':float(heading or 0.0),'terrain_seconds':patch_seconds,'encoding_and_write_seconds':time.perf_counter()-encode_started}
 
 class MissionWorker:
     def __init__(self,folder,cache,parent):
@@ -180,10 +185,14 @@ class MissionWorker:
         if action=='prepare':
             atom_json(self.folder/'mission.json',dict(**self.public,emitters=self.emitters,chart=str(self.folder/'chart.png')))
             self.status('ready',rid,manifest=str(self.folder/'mission.json'));return
+        if scenario=='endless':
+            if 'heading' not in req:raise ValueError('SCAN INHIBITED: aircraft heading missing')
+            validate_forward_scan(req['pose'],float(req['heading']),req['center'],float(req['extent']))
         self.status('scanning',rid)
         start=time.perf_counter()
         result=render_patch(self.world,req['pose'],req.get('center',[0,0]),float(req.get('extent',2000)),
-                            req.get('quality','detail'),self.folder,rid,accelerator=self.accelerator)
+                            req.get('quality','detail'),self.folder,rid,accelerator=self.accelerator,
+                            heading=float(req['heading']) if scenario=='endless' else None)
         self.status('complete',rid,**result,wall_seconds=time.perf_counter()-start)
         for pattern in ('radar_*.png','radar_*.r8'):
             files=sorted(self.folder.glob(pattern),key=lambda x:x.stat().st_mtime)

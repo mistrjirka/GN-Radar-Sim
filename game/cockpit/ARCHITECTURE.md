@@ -1,5 +1,8 @@
 # RAVEN TWO: component boundaries
 
+> Current exploration changes (heading-up bottom-center paper, locked acquisitions, whole-image resolving, approximate-range RWR and user-marked coordinate rounds) are described in `../../docs/PLAYABILITY.md`. Older measurements and original finite-mode contracts below are historical; the latest user corrections supersede them.
+
+
 This is a small playable prototype, not a framework. Keep components together
 when they have one job; split them when unrelated state starts sharing a lifecycle.
 Do not solve maintainability by moving every method into another file.

@@ -6,6 +6,10 @@ const RadarLink = preload("res://game/cockpit/radar_link.gd")
 const Intro = preload("res://game/cockpit/intro_sequence.gd")
 const Overlay = preload("res://game/cockpit/flight_overlay.gd")
 const Briefing=preload("res://game/cockpit/sortie_briefing.gd")
+const ScanGeometry=preload("res://game/cockpit/scan_geometry.gd")
+var acquisition=preload("res://game/cockpit/radar_acquisition.gd").new()
+var incoming_texture:Texture2D
+var playability_test:=false
 var briefing
 var scenario_mode := "endless"
 var world_stream
@@ -66,6 +70,7 @@ func _ready() -> void:
 			scenario_mode="reference"
 		if arg=="--performance-test":performance_test=true;profile_frames=true;scenario_mode="sortie"
 		if arg=="--profile-frames":profile_frames=true
+		if arg=="--playability-test":playability_test=true;scenario_mode="endless"
 		if arg=="--reference":scenario_mode="reference"
 		if arg=="--sortie":scenario_mode="sortie"
 		if arg=="--endless-test":endless_test=true;scenario_mode="endless"
@@ -84,6 +89,7 @@ func _ready() -> void:
 	var rig_started:=Time.get_ticks_usec()
 	rig = Rig.new()
 	add_child(rig)
+	rig.revised_station=scenario_mode=="endless"
 	rig.build()
 	if frame_probe:frame_probe.record_span("cockpit_mesh_build",rig_started,Time.get_ticks_usec())
 	mission = Mission.new()
@@ -105,7 +111,11 @@ func _ready() -> void:
 	_setup_audio()
 	link.launch(seed_number,scenario_mode)
 	_radio("RAVEN TWO / Loading terrain and paper charts. The cockpit will remain interactive.", "")
-	if performance_test:
+	if playability_test:
+		test_driver=load("res://game/cockpit/tests/playability_driver.gd").new()
+		test_driver.configure(self,capture_dir)
+		add_child(test_driver)
+	elif performance_test:
 		test_driver=load("res://game/cockpit/tests/performance_driver.gd").new()
 		test_driver.configure(self,capture_dir)
 		add_child(test_driver)
@@ -228,7 +238,7 @@ func _chart_prepared(image: Image, decode_ms: float) -> void:
 
 
 func _request_scan(initial: bool = false) -> void:
-	if not prepared_world or link.busy:
+	if not prepared_world or link.busy or acquisition.is_busy():
 		if not initial:
 			_play("click")
 		return
@@ -238,7 +248,20 @@ func _request_scan(initial: bool = false) -> void:
 		_radio("RADAR / HOLD engaged. Release HOLD before requesting a new frame.", "click")
 		return
 	var chosen:Array=mission.global_point(rig.chart.selected_center)
-	if link.scan(mission.radar_pose(), chosen, selected_extent, current_quality):
+	var heading:float=mission.heading
+	if mission.endless:
+		var reason:=ScanGeometry.inhibit_reason(mission.radar_pose(),heading,chosen,selected_extent)
+		if not reason.is_empty():
+			_radio("RADAR / "+reason+". Select a square ahead of the aircraft.","click")
+			return
+	if link.scan(mission.radar_pose(), chosen, selected_extent, current_quality,heading):
+		if overlay.captions.text.begins_with("RADAR /"):
+			overlay.caption_panel.hide();overlay.caption_seconds=0
+		if mission.endless:
+			acquisition.begin(link.waiting_id,mission.radar_pose(),heading,chosen,selected_extent,current_quality)
+			rig.chart.lock_acquisition()
+			mission.clear_designation()
+			rig.radar_material.set_shader_parameter("target_uv",Vector2(-1,-1))
 		scan_seconds = 0
 		mission.scan_transmit_time = 1.5
 		rig.set_lamp("tx", true)
@@ -246,11 +269,26 @@ func _request_scan(initial: bool = false) -> void:
 
 
 func _scan_ready(texture: Texture2D, details: Dictionary) -> void:
+	if mission.endless:
+		if not acquisition.receive(details):return
+		incoming_texture=texture
+		rig.radar_material.set_shader_parameter("radar_image",texture)
+		rig.radar_material.set_shader_parameter("has_frame",1.0)
+		rig.radar_material.set_shader_parameter("resolving",1.0)
+		rig.radar_material.set_shader_parameter("resolve_progress",0.0)
+		return
+	_finish_scan(texture,details)
+
+
+func _finish_scan(texture:Texture2D,details:Dictionary) -> void:
 	var apply_started:=Time.get_ticks_usec()
 	last_scan = details.duplicate(true)
-	last_scan["global_center"]=details["center"].duplicate()
+	last_scan["global_center"]=details.get("global_center",details["center"]).duplicate()
 	if mission.endless:
-		var p:Vector2=mission.local_point(details["center"]);last_scan["center"]=[p.x,p.y]
+		var p:Vector2=mission.local_point(last_scan["global_center"]);last_scan["center"]=[p.x,p.y]
+		rig.radar_material.set_shader_parameter("resolving",0.0)
+		rig.radar_material.set_shader_parameter("resolve_progress",1.0)
+		rig.chart.unlock_acquisition()
 	scan_count += 1
 	mission.record_scan()
 	rig.radar_material.set_shader_parameter("radar_image", texture)
@@ -262,6 +300,10 @@ func _scan_ready(texture: Texture2D, details: Dictionary) -> void:
 
 
 func _radar_error(message: String) -> void:
+	if acquisition.is_busy():
+		acquisition.fail()
+		rig.chart.unlock_acquisition()
+		rig.radar_material.set_shader_parameter("resolving",0.0)
 	rig.set_lamp("tx", false)
 	_radio(message + "  [H for controls]", "")
 	if test_driver and test_mode:
@@ -299,6 +341,10 @@ func _process(dt: float) -> void:
 			mission.speed = minf(110, mission.speed + 18 * dt)
 		if Input.is_physical_key_pressed(KEY_S):
 			mission.speed = maxf(38, mission.speed - 18 * dt)
+	if mission.endless and acquisition.stage=="resolving" and not paused and not help_visible:
+		var finished_resolving:bool=acquisition.advance(dt)
+		rig.radar_material.set_shader_parameter("resolve_progress",acquisition.progress)
+		if finished_resolving:_finish_scan(incoming_texture,acquisition.frame)
 	if prepared_world:
 		rig.chart.aircraft = mission.position
 		rig.chart.heading = mission.heading
@@ -390,9 +436,9 @@ func _update_instruments() -> void:
 		)
 	rig.set_lamp("frame", same_area and rig.powered)
 	rig.set_lamp("stored", not same_area and not last_scan.is_empty() and rig.powered)
-	rig.set_lamp("tx", link.busy and rig.powered)
+	rig.set_lamp("tx", (link.busy or acquisition.is_busy()) and rig.powered)
 	rig.counters["stores"].text = (
-		"ARM %d / CM %d %s"
+		("COORD %d / CM %d %s" if mission.endless else "ARM %d / CM %d %s")
 		% [mission.arm_count, mission.countermeasures, "LIVE" if mission.armed else "SAFE"]
 	)
 	rig.needles["alt"].rotation.z = lerpf(
@@ -418,6 +464,11 @@ func _update_instruments() -> void:
 	)
 	if mission.finished:
 		rig.mission_card.text = mission.phase_name()
+	if mission.endless:
+		rig.counters["scan_status"].text={"computing":"ACQUIRING / MAP HOLD","resolving":"RESOLVING / MAP HOLD","ready":"FRAME STORED","idle":"READY"}[acquisition.stage]
+		if acquisition.stage=="ready" and not mission.designated_point.is_empty():
+			rig.counters["scan_status"].text=mission.last_coordinate_outcome
+		rig.set_resolution_detent(current_quality)
 	var settings:Dictionary={"survey":"FAST 6x8m","map":"MED 4x5m","detail":"FINE 2x2.5m"}
 	rig.counters["resolution"].text=str(settings[current_quality])
 	rig.counters["scan_area"].text="AREA %.1fkm" % (selected_extent/1000)
@@ -455,13 +506,16 @@ func _update_hint() -> void:
 		overlay.hint.text = action.replace("_", " ").to_upper() + "   /   CLICK"
 	elif rig.uv_hit(rig.chart_quad, Vector2(.87, 1.12), pointer).x >= 0:
 		overlay.hint.text = "CHART / CLICK GUIDES · WHEEL SIZE · SHIFT HEADING · CTRL+SHIFT ADD FIX" if mission.endless else "CHART / CLICK SCAN · SHIFT COURSE · CTRL+SHIFT ADD FIX · DEL UNDO"
+	elif mission.endless and rig.uv_hit(rig.radar_quad,Vector2(1.08,.96),pointer).x>=0:
+		overlay.hint.text="RADAR / CLICK TO MARK COORDINATE · F TO FIRE" if acquisition.can_designate() else "RADAR / ACQUISITION IN PROGRESS"
 	else:
-		overlay.hint.text = "H / NOTES   B / LOCAL CHART   Z / PAPER SCALE" + ("    P / RESUME" if paused else "")
+		overlay.hint.text = "H / CONTROLS" + ("    P / RESUME" if paused else "")
 
 
 func _action(action: String) -> void:
 	if (paused or help_visible) and action not in ["help", "pause", "ack"]:
 		return
+	if acquisition.is_busy() and action in ["scan","resolution","range","hold","clear_point"]:return
 	rig.press_control(action)
 	match action:
 		"help":
@@ -497,7 +551,13 @@ func _action(action: String) -> void:
 			mission.toggle_arm()
 			_play("click")
 		"arm_fire":
-			mission.fire_arm()
+			if mission.endless:
+				if not acquisition.can_designate() or not mission.fire_coordinate():
+					_radio("WEAPONS / Mark a completed radar image, select MASTER ARM, then FIRE. Check range and remaining stores.","click")
+			else:mission.fire_arm()
+		"clear_point":
+			mission.clear_designation()
+			rig.radar_material.set_shader_parameter("target_uv",Vector2(-1,-1))
 		"chaff":
 			mission.deploy_countermeasure()
 		"release":
@@ -515,6 +575,7 @@ func _action(action: String) -> void:
 
 
 func _resize_area(direction: int) -> void:
+	if acquisition.is_busy():return
 	if mission.endless:
 		selected_extent=clampf(selected_extent+direction*200.0,400.0,4000.0)
 	else:
@@ -524,6 +585,7 @@ func _resize_area(direction: int) -> void:
 	_play("click")
 
 func _set_resolution(mode:String) -> void:
+	if acquisition.is_busy():return
 	if mode not in ["survey","map","detail"]:return
 	current_quality=mode
 	_update_instruments()
@@ -554,6 +616,11 @@ func _input(event: InputEvent) -> void:
 					rig.chart.select(point)
 					_play("click")
 				return
+			if mission.endless:
+				var radar_uv:Vector2=rig.uv_hit(rig.radar_quad,Vector2(1.08,.96),event.position)
+				if radar_uv.x>=0:
+					_designate(radar_uv)
+					return
 			_action(rig.action_at(event.position))
 	elif event is InputEventMouseMotion and dragging_head:
 		head_yaw = clampf(head_yaw - event.relative.x * .002, -.45, .45)
@@ -694,3 +761,13 @@ func _sheet_changed(data:Dictionary) -> void:
 	if last_scan.has("global_center"):
 		var p:Vector2=mission.local_point(last_scan["global_center"]);last_scan["center"]=[p.x,p.y]
 	briefing.configure(data,rig.chart.chart)
+
+
+func _designate(uv:Vector2) -> bool:
+	if paused or help_visible or not acquisition.can_designate():return false
+	var sample_uv:=ScanGeometry.screen_to_sample(uv)
+	var point:=ScanGeometry.sample_to_world(sample_uv,acquisition.frame)
+	if point.is_empty() or not mission.designate_radar_point(point,int(acquisition.frame["id"])):return false
+	rig.radar_material.set_shader_parameter("target_uv",sample_uv)
+	_play("click")
+	return true

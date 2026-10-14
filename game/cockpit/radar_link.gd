@@ -38,6 +38,7 @@ func launch(seed_number: int=42, mode: String="reference") -> void:
 	var cache:=OS.get_environment("RADAR_CACHE")
 	if cache.is_empty():cache=ProjectSettings.globalize_path("user://radar_world_cache")
 	mailbox=Mailbox.new()
+	mailbox.progressive_display=scenario=="endless"
 	if mailbox.start(folder)!=OK:
 		failed.emit("Cannot start background radar transport");return
 	pid=OS.create_process(python,PackedStringArray([ProjectSettings.globalize_path("res://game/cockpit/backend/mission_worker.py"),
@@ -55,10 +56,10 @@ func _send(data: Dictionary) -> bool:
 	mailbox.submit(data)
 	return true
 
-func scan(pose:Array,center,extent:float,quality:String="detail") -> bool:
+func scan(pose:Array,center,extent:float,quality:String="detail",heading:float=0.0) -> bool:
 	if not world_ready:return false
 	var xy:Array=center if center is Array else [center.x,center.y]
-	return _send({"action":"scan","pose":pose,"center":xy,"extent":extent,"quality":quality})
+	return _send({"action":"scan","pose":pose,"center":xy,"extent":extent,"quality":quality,"heading":heading})
 
 func _process(dt:float) -> void:
 	if closed or pid<0:return
@@ -92,7 +93,7 @@ func _process(dt:float) -> void:
 			if image==null:
 				failed.emit("Radar frame missing");continue
 			var begun:=Time.get_ticks_usec()
-			if texture and texture.get_width()==image.get_width() and texture.get_height()==image.get_height():texture.update(image)
+			if scenario!="endless" and texture and texture.get_width()==image.get_width() and texture.get_height()==image.get_height():texture.update(image)
 			else:texture=ImageTexture.create_from_image(image)
 			diagnostic_span.emit("radar_texture_upload_main",begun,Time.get_ticks_usec())
 			timing_event.emit("radar_texture_upload_main",float(Time.get_ticks_usec()-begun)/1000)
